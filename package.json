@@ -1,0 +1,73 @@
+{
+  "name": "same-screen-player",
+  "version": "0.1.0",
+  "description": "A focused multi-pane video browser for watching streams side by side.",
+  "private": true,
+  "main": "dist-electron/electron/main.js",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "build": "tsc -p tsconfig.node.json && node scripts/bundle-preloads.js && vite build",
+    "dist": "npm run build && electron-builder",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@ghostery/adblocker-electron": "^2.18.2",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.52.0",
+    "@types/node": "^22.13.4",
+    "@types/react": "^19.0.8",
+    "@types/react-dom": "^19.0.3",
+    "@types/ws": "^8.18.1",
+    "@vitejs/plugin-react": "^5.0.4",
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron": "^44.2.0",
+    "electron-builder": "^26.15.3",
+    "typescript": "^5.7.3",
+    "vite": "^8.2.2",
+    "vitest": "^3.0.8",
+    "wait-on": "^8.0.3"
+  },
+  "build": {
+    "appId": "com.samescreen.player",
+    "productName": "同屏播放",
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "chrome-extension",
+        "to": "chrome-extension"
+      },
+      {
+        "from": "electron/windows-window-helper.ps1",
+        "to": "windows-window-helper.ps1"
+      }
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "mac": {
+      "category": "public.app-category.video"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ]
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    }
+  }
+}

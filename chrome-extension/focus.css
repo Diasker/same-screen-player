@@ -1,0 +1,37 @@
+html.same-screen-focus-mode,
+html.same-screen-focus-mode body {
+  width: 100% !important;
+  height: 100% !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  margin: 0 !important;
+  overflow: hidden !important;
+  background: #000 !important;
+}
+
+html.same-screen-focus-mode .same-screen-focus-hidden {
+  display: none !important;
+}
+
+html.same-screen-focus-mode .same-screen-focus-ancestor {
+  width: 100% !important;
+  height: 100% !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  max-width: none !important;
+  max-height: none !important;
+  overflow: visible !important;
+}
+
+html.same-screen-focus-mode .same-screen-focus-target {
+  position: fixed !important;
+  inset: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  max-width: none !important;
+  max-height: none !important;
+  margin: 0 !important;
+  z-index: 2147483000 !important;
+  overflow: hidden !important;
+  background: #000 !important;
+}

@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Same Screen Player Focus",
+  "version": "1.0.0",
+  "description": "Player-focused layout for Same Screen Player.",
+  "permissions": ["storage"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "css": ["focus.css"],
+      "run_at": "document_start"
+    }
+  ]
+}
