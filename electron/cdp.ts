@@ -1,6 +1,5 @@
 import { promises as fs } from "node:fs";
 import { createServer } from "node:net";
-import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import WebSocket from "ws";
 import type { BrowserBackend, ChromeStatus, WindowBounds } from "../src/shared/types";
@@ -40,36 +39,6 @@ type ChromeSessionOptions = {
   extensionPath: string;
   executable: string;
 };
-
-export type HarvestedCookie = {
-  name: string;
-  value: string;
-  domain: string;
-  path: string;
-  secure: boolean;
-  httpOnly: boolean;
-  expirationDate?: number;
-  sameSite?: "unspecified" | "no_restriction" | "lax" | "strict";
-};
-
-type CdpCookie = {
-  name: string;
-  value: string;
-  domain: string;
-  path: string;
-  expires: number;
-  httpOnly: boolean;
-  secure: boolean;
-  session: boolean;
-  sameSite?: "Strict" | "Lax" | "None";
-};
-
-function mapSameSite(sameSite?: string): HarvestedCookie["sameSite"] {
-  if (sameSite === "Strict") return "strict";
-  if (sameSite === "Lax") return "lax";
-  if (sameSite === "None") return "no_restriction";
-  return "unspecified";
-}
 
 function isBlankTarget(info: CdpTargetInfo): boolean {
   return info.type === "page" && (info.url === "about:blank" || info.url === "chrome://newtab/" || info.url === "chrome://new-tab-page/");
@@ -301,61 +270,6 @@ export class ChromeSessionManager {
     return true;
   }
 
-  async getChromeVersion(): Promise<{ version: string; userAgent: string } | null> {
-    await this.ensureSession();
-    try {
-      const info = await this.connection!.send<{ product?: string; userAgent?: string }>("Browser.getVersion");
-      const product = typeof info.product === "string" && info.product.startsWith("Chrome/") ? info.product.slice("Chrome/".length) : "";
-      if (!product) return null;
-      return { version: product, userAgent: typeof info.userAgent === "string" && info.userAgent.length > 0 ? info.userAgent : "" };
-    } catch {
-      return null;
-    }
-  }
-
-  async harvestCloudflareCookies(url: string): Promise<HarvestedCookie[]> {
-    await this.ensureSession();
-    const host = new URL(url).hostname.toLowerCase();
-    const result = await this.connection!.send<{ cookies?: CdpCookie[] }>("Storage.getCookies");
-    return (result.cookies ?? [])
-      .filter((cookie) => {
-        const domain = (cookie.domain.startsWith(".") ? cookie.domain.slice(1) : cookie.domain).toLowerCase();
-        return host === domain || host.endsWith(`.${domain}`);
-      })
-      .filter((cookie) => cookie.name === "cf_clearance" || cookie.name === "__cf_bm" || cookie.name.startsWith("cf_"))
-      .map((cookie) => ({
-        name: cookie.name,
-        value: cookie.value,
-        domain: cookie.domain,
-        path: cookie.path,
-        secure: cookie.secure,
-        httpOnly: cookie.httpOnly,
-        expirationDate: cookie.session || cookie.expires <= 0 ? undefined : cookie.expires,
-        sameSite: mapSameSite(cookie.sameSite),
-      }));
-  }
-
-  async harvestCookies(domains: string[]): Promise<HarvestedCookie[]> {
-    await this.ensureSession();
-    const normalized = domains.map((domain) => domain.toLowerCase().replace(/^\./, ""));
-    const result = await this.connection!.send<{ cookies?: CdpCookie[] }>("Storage.getCookies");
-    return (result.cookies ?? [])
-      .filter((cookie) => {
-        const domain = (cookie.domain.startsWith(".") ? cookie.domain.slice(1) : cookie.domain).toLowerCase();
-        return normalized.some((candidate) => domain === candidate || domain.endsWith(`.${candidate}`));
-      })
-      .map((cookie) => ({
-        name: cookie.name,
-        value: cookie.value,
-        domain: cookie.domain,
-        path: cookie.path,
-        secure: cookie.secure,
-        httpOnly: cookie.httpOnly,
-        expirationDate: cookie.session || cookie.expires <= 0 ? undefined : cookie.expires,
-        sameSite: mapSameSite(cookie.sameSite),
-      }));
-  }
-
   async closePane(paneId: string): Promise<boolean> {
     const pane = this.panes.get(paneId);
     if (!pane || !this.connection) return false;
@@ -377,11 +291,6 @@ export class ChromeSessionManager {
     if (!this.connection) return;
     void enabled;
     await this.applyLayout(bounds);
-  }
-
-  async clearProfile(): Promise<void> {
-    await this.closeAll();
-    await fs.rm(this.options.userDataDir, { recursive: true, force: true });
   }
 
   async closeAll(): Promise<void> {

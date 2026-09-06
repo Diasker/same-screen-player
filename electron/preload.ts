@@ -5,8 +5,9 @@ let htmlFullscreenListener: ((event: Electron.IpcRendererEvent, paneId: unknown,
 let toggleInteractionListener: (() => void) | null = null;
 let toggleAppFullscreenListener: (() => void) | null = null;
 let escapeListener: (() => void) | null = null;
-let paneBlockedListener: ((event: Electron.IpcRendererEvent, paneId: unknown, statusCode: unknown) => void) | null = null;
+let paneBlockedListener: ((event: Electron.IpcRendererEvent, paneId: unknown, statusCode: unknown, challenge: unknown) => void) | null = null;
 let chromeSessionErrorListener: ((event: Electron.IpcRendererEvent, message: unknown) => void) | null = null;
+let proxyStatusListener: ((event: Electron.IpcRendererEvent, status: unknown) => void) | null = null;
 
 contextBridge.exposeInMainWorld("desktop", {
   guestPreloadUrl: ipcRenderer.sendSync("get-guest-preload-url") as string,
@@ -39,18 +40,26 @@ contextBridge.exposeInMainWorld("desktop", {
     escapeListener = () => callback();
     ipcRenderer.on("window:escape", escapeListener);
   },
-  onPaneBlocked: (callback: (paneId: string, statusCode: number) => void): void => {
+  onPaneBlocked: (callback: (paneId: string, statusCode: number, challenge: boolean) => void): void => {
     if (paneBlockedListener) ipcRenderer.removeListener("pane:blocked", paneBlockedListener);
-    paneBlockedListener = (_event, paneId: unknown, statusCode: unknown) => {
-      if (typeof paneId === "string" && typeof statusCode === "number") callback(paneId, statusCode);
+    paneBlockedListener = (_event, paneId: unknown, statusCode: unknown, challenge: unknown) => {
+      if (typeof paneId === "string" && typeof statusCode === "number") callback(paneId, statusCode, Boolean(challenge));
     };
     ipcRenderer.on("pane:blocked", paneBlockedListener);
   },
   loadLayout: (): Promise<unknown> => ipcRenderer.invoke("layout:load"),
   saveLayout: (layout: unknown): Promise<boolean> => ipcRenderer.invoke("layout:save", layout),
   clearSession: (): Promise<boolean> => ipcRenderer.invoke("session:clear"),
-  registerPane: (paneId: string, webContentsId: number, partition: string, pageUrl?: string): Promise<boolean> =>
-    ipcRenderer.invoke("pane:register", paneId, webContentsId, partition, pageUrl),
+  registerPane: (paneId: string, webContentsId: number, partition: string, pageUrl?: string, proxy?: unknown): Promise<boolean> =>
+    ipcRenderer.invoke("pane:register", paneId, webContentsId, partition, pageUrl, proxy),
+  getGlobalProxy: (): Promise<unknown> => ipcRenderer.invoke("proxy:getGlobal"),
+  setGlobalProxy: (settings: unknown): Promise<unknown> => ipcRenderer.invoke("proxy:setGlobal", settings),
+  setPaneProxy: (paneId: string, settings: unknown): Promise<unknown> => ipcRenderer.invoke("proxy:setPane", paneId, settings),
+  onProxyStatus: (callback: (status: unknown) => void): void => {
+    if (proxyStatusListener) ipcRenderer.removeListener("proxy:status", proxyStatusListener);
+    proxyStatusListener = (_event, status: unknown) => callback(status);
+    ipcRenderer.on("proxy:status", proxyStatusListener);
+  },
   openInChrome: (url: string): Promise<boolean> => ipcRenderer.invoke("pane:openInChrome", url),
   openAuthWindow: (url: string, partition: string): Promise<boolean> => ipcRenderer.invoke("pane:openAuthWindow", url, partition),
   exitWebpageFullscreen: (paneId?: string): Promise<boolean> => ipcRenderer.invoke("window:exitWebpageFullscreen", paneId),
@@ -62,13 +71,7 @@ contextBridge.exposeInMainWorld("desktop", {
   reportChallengeState: (paneId: string, state: unknown): Promise<boolean> =>
     ipcRenderer.invoke("pane:reportChallengeState", paneId, state),
   inspectFingerprint: (paneId: string): Promise<unknown> => ipcRenderer.invoke("pane:inspectFingerprint", paneId),
-  harvestChromeClearance: (paneId: string, url: string): Promise<unknown> =>
-    ipcRenderer.invoke("chrome:harvestClearance", paneId, url),
-  applyClearance: (partition: string, url: string, cookies: unknown): Promise<boolean> =>
-    ipcRenderer.invoke("pane:applyClearance", partition, url, cookies),
-  openChromeSolver: (url: string): Promise<unknown> => ipcRenderer.invoke("chrome:openSolver", url),
   openChromeLogin: (url: string): Promise<unknown> => ipcRenderer.invoke("chrome:openLogin", url),
-  clearChromeProfile: (): Promise<boolean> => ipcRenderer.invoke("chrome:clearProfile"),
   reportPlaybackState: (paneId: string, state: unknown): Promise<boolean> =>
     ipcRenderer.invoke("pane:reportPlaybackState", { paneId, state }),
   logFocusDiagnostic: (paneId: string, info: unknown): Promise<boolean> =>

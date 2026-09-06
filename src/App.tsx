@@ -1,18 +1,28 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ReactElement } from "react";
+import type { CSSProperties, ReactElement } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import {
   MAX_PANES,
   createPreset,
+  defaultGlobalProxySettings,
+  defaultPaneProxySettings,
   getPaneIds,
   isLayoutNode,
+  normalizeGlobalProxySettings,
+  normalizeHttpProxyEndpoint,
   removePane,
+  resolvePaneProxySession,
   setRatioAtPath,
   splitPane,
+  swapPanePositions,
   type InteractionMode,
   type CloudflareStatus,
+  type GlobalProxySettings,
+  type HttpProxyEndpoint,
   type LayoutNode,
   type Orientation,
+  type PaneProxyMode,
+  type PaneProxySettings,
   type PaneRuntime,
   type PlaybackSnapshot,
   type PlayerStatus,
@@ -63,6 +73,18 @@ function emptyPlayback(): PlaybackSnapshot {
 
 const RATE_OPTIONS = [0.5, 0.75, 1, 1.25, 1.5, 2];
 const CUSTOM_RATE_VALUE = "custom";
+const FONT_SCALE_OPTIONS = [0.8, 0.9, 1, 1.1, 1.25, 1.4];
+const FONT_SCALE_STORAGE_KEY = "same-screen-player.font-scale";
+
+function initialFontScale(): number {
+  if (typeof window === "undefined") return 1;
+  try {
+    const value = Number(window.localStorage.getItem(FONT_SCALE_STORAGE_KEY));
+    return FONT_SCALE_OPTIONS.includes(value) ? value : 1;
+  } catch {
+    return 1;
+  }
+}
 
 function makeRuntime(paneId: string): PaneRuntime {
   return {
@@ -77,6 +99,8 @@ function makeRuntime(paneId: string): PaneRuntime {
     userPauseIntent: false,
     focusModeEnabled: false,
     cloudflareStatus: "none",
+    proxy: defaultPaneProxySettings(),
+    proxyAutoIsolated: false,
   };
 }
 
@@ -179,6 +203,7 @@ type PaneViewProps = {
   onSplit: (orientation: Orientation) => void;
   onRemove: () => void;
   onOpenChrome: () => void;
+  onProxyChange: (settings: PaneProxySettings) => void;
   interactionMode: InteractionMode;
 };
 
@@ -219,6 +244,9 @@ function PaneView(props: PaneViewProps): ReactElement {
   const [showControls, setShowControls] = useState(false);
   const [seekDraft, setSeekDraft] = useState<number | null>(null);
   const [navigationState, setNavigationState] = useState({ canGoBack: false, canGoForward: false });
+  const [proxyEditorOpen, setProxyEditorOpen] = useState(false);
+  const [proxyDraft, setProxyDraft] = useState<HttpProxyEndpoint>(() => ({ ...runtime.proxy.custom }));
+  const [proxyEditorError, setProxyEditorError] = useState<string | null>(null);
   const controlsHideTimerRef = useRef<number | null>(null);
   runtimeRef.current = runtime;
   activeRef.current = props.active;
@@ -307,6 +335,19 @@ function PaneView(props: PaneViewProps): ReactElement {
   }, [props.interactionMode, hideControls]);
 
   useEffect(() => {
+    setProxyDraft({ ...runtime.proxy.custom });
+  }, [runtime.proxy.custom]);
+
+  useEffect(() => {
+    const webview = webviewRef.current;
+    if (!webview || !webviewReadyRef.current || !runtime.url) return;
+    void window.desktop.setPaneProxy(runtime.paneId, runtime.proxy).then((result) => {
+      const value = result as { ok?: boolean; message?: string };
+      if (!value.ok) props.onUpdate({ error: value.message || "应用分屏代理失败" });
+    }).catch((error) => props.onUpdate({ error: error instanceof Error ? error.message : "应用分屏代理失败" }));
+  }, [runtime.paneId, runtime.proxy, runtime.url, partition]);
+
+  useEffect(() => {
     const webview = webviewRef.current;
     if (!webview || !runtime.url || !webviewReadyRef.current) return;
     navigationRequestedRef.current = true;
@@ -386,7 +427,8 @@ function PaneView(props: PaneViewProps): ReactElement {
       if (message.channel === "player-status") {
         const value = (message.args?.[0] ?? {}) as { status?: PlayerStatus; message?: string };
         const status = value.status && ["idle", "loading", "ready", "unrecognized", "challenge", "blocked", "crashed"].includes(value.status) ? value.status : "loading";
-        onUpdateRef.current({ playerStatus: status, error: value.message || (status === "ready" ? undefined : currentRuntime.error) });
+        const error = status === "challenge" ? "请在当前分屏完成 Cloudflare 验证" : value.message || (status === "ready" ? undefined : currentRuntime.error);
+        onUpdateRef.current({ playerStatus: status, error });
         return;
       }
       if (message.channel === "focus-diagnostic") {
@@ -398,26 +440,32 @@ function PaneView(props: PaneViewProps): ReactElement {
       if (message.channel === "request-exit-fullscreen") void window.desktop.exitWebpageFullscreen(currentRuntime.paneId);
     };
     const onDomReady = () => {
-      webviewReadyRef.current = true;
-      syncNavigationState();
       const currentRuntime = runtimeRef.current;
-      void window.desktop.registerPane(currentRuntime.paneId, webview.getWebContentsId(), partitionFor(currentRuntime), currentRuntime.url);
-      void window.desktop.setChallengeMode(currentRuntime.paneId, currentRuntime.cloudflareStatus === "detected" || currentRuntime.cloudflareStatus === "looped");
-      try {
-        webview.send("pane-activity", activeRef.current);
-        webview.send("set-mute", currentRuntime.muted);
-        webview.send("set-focus-mode", currentRuntime.focusModeEnabled);
-      } catch {
-      }
-      if (currentRuntime.url && !navigationRequestedRef.current) {
-        navigationRequestedRef.current = true;
-        try {
-          void webview.loadURL(currentRuntime.url).catch(() => undefined);
-        } catch {
-          webviewReadyRef.current = false;
-          navigationRequestedRef.current = false;
+      void window.desktop.registerPane(currentRuntime.paneId, webview.getWebContentsId(), partitionFor(currentRuntime), currentRuntime.url, currentRuntime.proxy).then((registered) => {
+        if (webviewRef.current !== webview || !registered) {
+          if (!registered) onUpdateRef.current({ error: "分屏网络配置失败" });
+          return;
         }
-      }
+        webviewReadyRef.current = true;
+        syncNavigationState();
+        void window.desktop.setChallengeMode(currentRuntime.paneId, currentRuntime.cloudflareStatus === "detected" || currentRuntime.cloudflareStatus === "looped");
+        try {
+          webview.send("pane-activity", activeRef.current);
+          webview.send("set-mute", currentRuntime.muted);
+          webview.send("set-focus-mode", currentRuntime.focusModeEnabled);
+        } catch {
+        }
+        const latestRuntime = runtimeRef.current;
+        if (latestRuntime.url && !navigationRequestedRef.current) {
+          navigationRequestedRef.current = true;
+          try {
+            void webview.loadURL(latestRuntime.url).catch(() => undefined);
+          } catch {
+            webviewReadyRef.current = false;
+            navigationRequestedRef.current = false;
+          }
+        }
+      }).catch((error) => onUpdateRef.current({ error: error instanceof Error ? error.message : "分屏网络配置失败" }));
     };
     const onNavigation = (event: Event) => {
       const navigation = event as Event & { url?: string };
@@ -584,33 +632,37 @@ function PaneView(props: PaneViewProps): ReactElement {
     props.onUpdate({ userPauseIntent: false, playerStatus: "loading", cloudflareStatus: "none", error: undefined });
     webviewRef.current?.reload();
   };
-  const importClearance = async () => {
-    props.onUpdate({ error: undefined });
-    const harvest = await window.desktop.harvestChromeClearance(runtime.paneId, runtime.url);
-    const value = harvest as { ok?: boolean; cookies?: unknown[]; message?: string };
-    if (!value.ok || !Array.isArray(value.cookies) || value.cookies.length === 0) {
-      props.onUpdate({ error: value.message || "未在 Chrome 中完成验证，或未找到通行 Cookie" });
-      return;
-    }
-    const applied = await window.desktop.applyClearance(partition, runtime.url, value.cookies);
-    if (applied) {
-      await window.desktop.setChallengeMode(runtime.paneId, false);
-      webviewRef.current?.reload();
-      props.onUpdate({ cloudflareStatus: "none", playerStatus: "loading", error: undefined });
-    } else {
-      props.onUpdate({ error: "写入通行 Cookie 失败" });
-    }
-  };
-  const openSolver = async () => {
-    if (!runtime.url) return;
-    props.onUpdate({ error: undefined });
-    const result = await window.desktop.openChromeSolver(runtime.url);
-    const value = result as { ok?: boolean; message?: string };
-    props.onUpdate({ error: value.ok ? undefined : value.message || "Chrome 验证窗口启动失败" });
-  };
   const reloadChallenge = async () => {
     const reloaded = await window.desktop.reloadChallenge(runtime.paneId);
     if (reloaded) props.onUpdate({ cloudflareStatus: "detected", playerStatus: "loading", error: undefined, userPauseIntent: false });
+  };
+  const toggleSessionMode = () => {
+    if (runtime.sessionMode === "isolated" && runtime.proxy.mode !== "inherit") {
+      props.onUpdate({ error: "请先将分屏代理改为“跟随全局”，再切换共享会话" });
+      return;
+    }
+    props.onUpdate({ sessionMode: runtime.sessionMode === "shared" ? "isolated" : "shared", proxyAutoIsolated: false, userPauseIntent: false, playerStatus: "loading", playback: emptyPlayback(), playing: false, focusModeEnabled: false, cloudflareStatus: "none", error: undefined });
+  };
+  const chooseProxyMode = (mode: PaneProxyMode) => {
+    if (mode === "custom") {
+      setProxyDraft({ ...runtime.proxy.custom });
+      setProxyEditorError(null);
+      setProxyEditorOpen(true);
+      return;
+    }
+    setProxyEditorOpen(false);
+    setProxyEditorError(null);
+    props.onProxyChange({ mode, custom: runtime.proxy.custom });
+  };
+  const savePaneProxy = () => {
+    const custom = normalizeHttpProxyEndpoint(proxyDraft);
+    if (!custom) {
+      setProxyEditorError("请输入有效的代理地址和 1–65535 端口");
+      return;
+    }
+    setProxyEditorOpen(false);
+    setProxyEditorError(null);
+    props.onProxyChange({ mode: "custom", custom });
   };
   const handleMouseMove = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (!runtime.url) return;
@@ -673,31 +725,43 @@ function PaneView(props: PaneViewProps): ReactElement {
             <button className={`icon-button ${runtime.adblockEnabled ? "selected" : "warning"}`} onClick={() => void toggleAdblock()}>{runtime.adblockEnabled ? "拦截" : "放行"}</button>
             <button className="icon-button" onClick={() => props.onSplit("horizontal")}>左右分屏</button>
             <button className="icon-button" onClick={() => props.onSplit("vertical")}>上下分屏</button>
-            <button className="icon-button" onClick={() => props.onUpdate({ sessionMode: runtime.sessionMode === "shared" ? "isolated" : "shared", userPauseIntent: false, playerStatus: "loading", playback: emptyPlayback(), playing: false, focusModeEnabled: false, cloudflareStatus: "none" })}>{runtime.sessionMode === "shared" ? "共享会话" : "独立会话"}</button>
+            <button className="icon-button" onClick={toggleSessionMode} disabled={runtime.sessionMode === "isolated" && runtime.proxy.mode !== "inherit"} title={runtime.sessionMode === "isolated" && runtime.proxy.mode !== "inherit" ? "请先改为跟随全局代理" : undefined}>{runtime.sessionMode === "shared" ? "共享会话" : "独立会话"}</button>
             {authenticationUrlFor(runtime.url) && <button className="icon-button" onClick={openLogin}>登录</button>}
-            <button className="icon-button" onClick={() => void openSolver()} title="在独立 Chrome 窗口中完成 Cloudflare 验证">Chrome 验证</button>
-            <button className="icon-button primary" onClick={() => void importClearance()} title="从 Chrome 导入通行 Cookie 并刷新本分屏">导入验证</button>
             <button className={`icon-button ${runtime.focusModeEnabled ? "selected" : "warning"}`} onClick={toggleFocusMode}>{runtime.focusModeEnabled ? "专注模式" : "网页原始模式"}</button>
+            <select className="pane-proxy-select" aria-label="分屏代理" value={runtime.proxy.mode} onChange={(event) => chooseProxyMode(event.target.value as PaneProxyMode)}>
+              <option value="inherit">跟随全局代理</option>
+              <option value="direct">分屏直连</option>
+              <option value="custom">分屏自定义 HTTP</option>
+            </select>
             {(runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped") && <button className="icon-button warning" onClick={() => void reloadChallenge()}>重新加载验证页</button>}
-            {(runtime.playerStatus === "challenge" || runtime.playerStatus === "blocked") && <button className="icon-button warning" onClick={props.onOpenChrome}>用 Chrome 打开</button>}
+            {runtime.playerStatus === "blocked" && <button className="icon-button warning" onClick={props.onOpenChrome}>用 Chrome 打开</button>}
             <button className="icon-button" onClick={hideControls}>收起</button>
             <button className="icon-button danger" onClick={props.onRemove}>关闭</button>
           </div>
+          {runtime.proxyAutoIsolated && <div className="proxy-isolation-note">此分屏使用独立代理，Cookie 不再与共享会话同步；改回“跟随全局代理”可恢复共享。</div>}
           {runtime.error && <div className="pane-error">{runtime.error}</div>}
           {runtime.playerStatus === "unrecognized" && !runtime.error && <div className="pane-error">无法识别播放器，已保留网页兼容画面。</div>}
           {runtime.cloudflareStatus === "detected" && <div className="pane-error">检测到 Cloudflare 验证，已放行验证资源，请在当前页面完成验证。</div>}
-          {runtime.cloudflareStatus === "looped" && <div className="pane-error">验证仍在循环，应用已停止自动刷新；可手动重新加载验证页或用 Chrome 打开。</div>}
+          {runtime.cloudflareStatus === "looped" && <div className="pane-error">验证仍在循环，应用已停止自动刷新；可手动重新加载验证页。</div>}
           {decoderIssue && <div className="pane-error">视频尚未解码，当前视频尺寸无效；可切换“网页原始模式”重试。</div>}
           {renderIssue && <div className="pane-error">视频层渲染异常；可切换“网页原始模式”恢复站点原生布局。</div>}
         </div>
       )}
+      {runtime.url && props.interactionMode === "app" && proxyEditorOpen && (
+        <div className="proxy-popover pane-proxy-popover" onPointerDown={(event) => event.stopPropagation()} role="dialog" aria-label="分屏代理设置">
+          <div className="proxy-popover-title">分屏自定义 HTTP 代理</div>
+          {runtime.sessionMode === "shared" && <div className="proxy-form-hint warning">保存后会自动切换到独立会话，此分屏将不再共享 Cookie。</div>}
+          <label className="proxy-checkbox"><input type="checkbox" checked onChange={() => { setProxyEditorOpen(false); props.onProxyChange({ mode: "direct", custom: proxyDraft }); }} />使用代理服务器</label>
+          <ProxyEndpointFields value={proxyDraft} onChange={setProxyDraft} />
+          {proxyEditorError && <div className="proxy-form-error">{proxyEditorError}</div>}
+          <div className="proxy-form-actions"><button className="icon-button" onClick={() => setProxyEditorOpen(false)}>取消</button><button className="icon-button primary" onClick={savePaneProxy}>保存</button></div>
+        </div>
+      )}
       {runtime.url && props.interactionMode === "web" && (runtime.error || runtime.playerStatus === "unrecognized" || runtime.playerStatus === "challenge" || runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped") && (
         <div className="pane-notice">
-          <span>{runtime.cloudflareStatus === "detected" ? "检测到 Cloudflare 验证，已放行验证资源，请在当前页面完成验证。" : runtime.cloudflareStatus === "looped" ? "验证仍在循环，应用已停止自动刷新。" : runtime.error || (runtime.playerStatus === "challenge" ? "该站点需要在真实浏览器中完成 Cloudflare 验证" : "无法识别播放器，已保留网页兼容画面")}</span>
+          <span>{runtime.cloudflareStatus === "detected" ? "检测到 Cloudflare 验证，已放行验证资源，请在当前页面完成验证。" : runtime.cloudflareStatus === "looped" ? "验证仍在循环，应用已停止自动刷新。" : runtime.error || (runtime.playerStatus === "challenge" ? "请在当前分屏完成 Cloudflare 验证" : "无法识别播放器，已保留网页兼容画面")}</span>
           {(runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped") && <button className="icon-button warning" onClick={() => void reloadChallenge()}>重新加载验证页</button>}
-          <button className="icon-button" onClick={() => void openSolver()}>用 Chrome 验证</button>
-          <button className="icon-button primary" onClick={() => void importClearance()}>导入验证</button>
-          {(runtime.playerStatus === "challenge" || runtime.playerStatus === "blocked") && <button className="icon-button warning" onClick={props.onOpenChrome}>用 Chrome 打开</button>}
+          {runtime.playerStatus === "blocked" && <button className="icon-button warning" onClick={props.onOpenChrome}>用 Chrome 打开</button>}
         </div>
       )}
       {runtime.url && props.interactionMode === "app" && !showControls && <button className="pane-badge" onPointerDown={(event) => event.stopPropagation()} onClick={revealControls}>{runtime.error ? "播放受限" : runtime.playerStatus === "unrecognized" ? "播放器未识别" : runtime.playing ? "播放中" : "已暂停"} · 控制</button>}
@@ -735,7 +799,9 @@ type LayoutSurfaceProps = {
   onActive: (paneId: string) => void;
   onNavigate: (paneId: string, value: string) => void;
   onUpdatePane: (paneId: string, patch: Partial<PaneRuntime>) => void;
+  onProxyChange: (paneId: string, settings: PaneProxySettings) => void;
   onResize: (path: number[], ratio: number) => void;
+  onSwap: (firstPaneId: string, secondPaneId: string) => void;
   onSplit: (paneId: string, orientation: Orientation) => void;
   onRemove: (paneId: string) => void;
   onOpenChrome: (paneId: string) => void;
@@ -744,13 +810,101 @@ type LayoutSurfaceProps = {
 
 function LayoutSurface(props: LayoutSurfaceProps): ReactElement {
   const geometry = useMemo(() => getGeometry(props.layout), [props.layout]);
+  const paneRefs = useRef(new Map<string, HTMLDivElement>());
+  const dragRef = useRef<{ paneId: string; dragging: boolean; startX: number; startY: number; offsetX: number; offsetY: number; targetPaneId: string | null } | null>(null);
+  const [dragState, setDragState] = useState<{ paneId: string; dragging: boolean; startX: number; startY: number; offsetX: number; offsetY: number; targetPaneId: string | null } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ paneId: string; left: number; top: number } | null>(null);
+
+  useEffect(() => {
+    paneRefs.current.forEach((_element, paneId) => {
+      if (!geometry.panes.some((pane) => pane.paneId === paneId)) paneRefs.current.delete(paneId);
+    });
+  }, [geometry.panes]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const closeMenu = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof HTMLElement && target.closest(".pane-context-menu")) return;
+      setContextMenu(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setContextMenu(null);
+    };
+    document.addEventListener("pointerdown", closeMenu, true);
+    document.addEventListener("keydown", closeOnEscape, true);
+    return () => {
+      document.removeEventListener("pointerdown", closeMenu, true);
+      document.removeEventListener("keydown", closeOnEscape, true);
+    };
+  }, [contextMenu]);
+
+  useEffect(() => {
+    if (props.interactionMode !== "app") {
+      dragRef.current = null;
+      setDragState(null);
+      setContextMenu(null);
+    }
+  }, [props.interactionMode]);
+
+  const startDrag = (event: ReactPointerEvent<HTMLDivElement>, paneId: string) => {
+    if (props.interactionMode !== "app" || event.button !== 0) return;
+    const target = event.target;
+    if (target instanceof HTMLElement && target.closest("button, input, select, textarea, a, .pane-controls, .pane-control-trigger, .pane-badge")) return;
+    setContextMenu(null);
+    props.onActive(paneId);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const next = { paneId, dragging: false, startX: event.clientX, startY: event.clientY, offsetX: 0, offsetY: 0, targetPaneId: null as string | null };
+    dragRef.current = next;
+    setDragState(next);
+  };
+
+  const updateDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const current = dragRef.current;
+    if (!current || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
+    const offsetX = event.clientX - current.startX;
+    const offsetY = event.clientY - current.startY;
+    const dragging = current.dragging || Math.hypot(offsetX, offsetY) >= 5;
+    let targetPaneId: string | null = null;
+    if (dragging) {
+      paneRefs.current.forEach((element, candidatePaneId) => {
+        if (candidatePaneId === current.paneId) return;
+        const bounds = element.getBoundingClientRect();
+        if (event.clientX >= bounds.left && event.clientX <= bounds.right && event.clientY >= bounds.top && event.clientY <= bounds.bottom) targetPaneId = candidatePaneId;
+      });
+    }
+    const next = { ...current, dragging, offsetX, offsetY, targetPaneId };
+    dragRef.current = next;
+    setDragState(next);
+  };
+
+  const finishDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const current = dragRef.current;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    dragRef.current = null;
+    setDragState(null);
+    if (current?.dragging && current.targetPaneId) props.onSwap(current.paneId, current.targetPaneId);
+  };
+
+  const showContextMenu = (event: React.MouseEvent<HTMLDivElement>, paneId: string) => {
+    if (props.interactionMode !== "app") return;
+    event.preventDefault();
+    props.onActive(paneId);
+    const menuWidth = 150;
+    const menuHeight = 42;
+    setContextMenu({ paneId, left: Math.max(6, Math.min(event.clientX, window.innerWidth - menuWidth - 6)), top: Math.max(6, Math.min(event.clientY, window.innerHeight - menuHeight - 6)) });
+  };
+
   return (
     <div className="layout-surface">
       {geometry.panes.map((rect) => {
         const runtime = props.runtimes[rect.paneId] ?? makeRuntime(rect.paneId);
-        return <div key={rect.paneId} className="layout-pane" style={{ left: `${rect.left * 100}%`, top: `${rect.top * 100}%`, width: `${rect.width * 100}%`, height: `${rect.height * 100}%` }}><PaneView runtime={runtime} active={props.activePaneId === rect.paneId} interactionMode={props.interactionMode} guestPreloadUrl={props.guestPreloadUrl} onActive={() => props.onActive(rect.paneId)} onNavigate={(value) => props.onNavigate(rect.paneId, value)} onUpdate={(patch) => props.onUpdatePane(rect.paneId, patch)} onSplit={(orientation) => props.onSplit(rect.paneId, orientation)} onRemove={() => props.onRemove(rect.paneId)} onOpenChrome={() => props.onOpenChrome(rect.paneId)} /></div>;
+        const isDragged = dragState?.paneId === rect.paneId && dragState.dragging;
+        const isDropTarget = dragState?.targetPaneId === rect.paneId;
+        return <div key={rect.paneId} ref={(element) => { if (element) paneRefs.current.set(rect.paneId, element); else paneRefs.current.delete(rect.paneId); }} className={`layout-pane ${isDragged ? "is-dragging" : ""} ${isDropTarget ? "is-drop-target" : ""}`} style={{ left: `${rect.left * 100}%`, top: `${rect.top * 100}%`, width: `${rect.width * 100}%`, height: `${rect.height * 100}%`, transform: isDragged ? `translate(${dragState.offsetX}px, ${dragState.offsetY}px)` : undefined }} onPointerDown={(event) => startDrag(event, rect.paneId)} onPointerMove={updateDrag} onPointerUp={finishDrag} onPointerCancel={finishDrag} onContextMenu={(event) => showContextMenu(event, rect.paneId)}><PaneView runtime={runtime} active={props.activePaneId === rect.paneId} interactionMode={props.interactionMode} guestPreloadUrl={props.guestPreloadUrl} onActive={() => props.onActive(rect.paneId)} onNavigate={(value) => props.onNavigate(rect.paneId, value)} onUpdate={(patch) => props.onUpdatePane(rect.paneId, patch)} onProxyChange={(settings) => props.onProxyChange(rect.paneId, settings)} onSplit={(orientation) => props.onSplit(rect.paneId, orientation)} onRemove={() => props.onRemove(rect.paneId)} onOpenChrome={() => props.onOpenChrome(rect.paneId)} /></div>;
       })}
       {geometry.dividers.map((divider) => <LayoutDivider key={divider.path.join(".")} divider={divider} onResize={props.onResize} />)}
+      {contextMenu && <div className="pane-context-menu" style={{ left: contextMenu.left, top: contextMenu.top }} role="menu"><button type="button" role="menuitem" className="pane-context-action" disabled={geometry.panes.length <= 1} onClick={() => { setContextMenu(null); props.onRemove(contextMenu.paneId); }}>关闭当前分屏</button></div>}
     </div>
   );
 }
@@ -763,6 +917,23 @@ function UrlEditor({ value, onChange, onSubmit, placeholder }: { value: string; 
   return <div className="url-editor"><input value={value} onChange={(event) => onChange(event.target.value)} onKeyDown={(event) => event.key === "Enter" && onSubmit()} placeholder={placeholder} /><button className="open-button" onClick={onSubmit}>播放</button></div>;
 }
 
+function ProxyEndpointFields({ value, onChange }: { value: HttpProxyEndpoint; onChange: (value: HttpProxyEndpoint) => void }): ReactElement {
+  return <div className="proxy-endpoint-fields">
+    <div className="proxy-field-row">
+      <label>代理 IP 地址<input value={value.host} onChange={(event) => onChange({ ...value, host: event.target.value })} placeholder="127.0.0.1" /></label>
+      <label className="proxy-port-field">端口<input type="number" min={1} max={65535} value={value.port || ""} onChange={(event) => onChange({ ...value, port: event.target.value === "" ? 0 : Number(event.target.value) })} placeholder="8080" /></label>
+    </div>
+    <label>例外地址（使用英文分号分隔）<textarea value={value.bypassList} onChange={(event) => onChange({ ...value, bypassList: event.target.value })} placeholder="localhost;127.0.0.1;192.168.*" rows={3} /></label>
+    <label className="proxy-checkbox"><input type="checkbox" checked={value.bypassLocal} onChange={(event) => onChange({ ...value, bypassLocal: event.target.checked })} />请勿将代理服务器用于本地(Intranet)地址</label>
+  </div>;
+}
+
+function proxyModeLabel(mode: string): string {
+  if (mode === "direct") return "直连";
+  if (mode === "custom") return "自定义 HTTP";
+  return "系统代理";
+}
+
 export default function App(): ReactElement {
   const [layout, setLayout] = useState<LayoutNode>(() => createPreset("single"));
   const [runtimes, setRuntimes] = useState<Record<string, PaneRuntime>>({ "pane-1": makeRuntime("pane-1") });
@@ -773,6 +944,11 @@ export default function App(): ReactElement {
   const [htmlFullscreen, setHtmlFullscreen] = useState(false);
   const [htmlFullscreenPaneId, setHtmlFullscreenPaneId] = useState<string | null>(null);
   const [interactionMode, setInteractionMode] = useState<InteractionMode>("web");
+  const [fontScale, setFontScale] = useState(initialFontScale);
+  const [globalProxy, setGlobalProxy] = useState<GlobalProxySettings>(() => defaultGlobalProxySettings());
+  const [globalProxyDraft, setGlobalProxyDraft] = useState<GlobalProxySettings>(() => defaultGlobalProxySettings());
+  const [globalProxyOpen, setGlobalProxyOpen] = useState(false);
+  const [globalProxyError, setGlobalProxyError] = useState<string | null>(null);
   const paneIds = useMemo(() => getPaneIds(layout), [layout]);
 
   useEffect(() => {
@@ -800,12 +976,18 @@ export default function App(): ReactElement {
         void window.desktop.setFullscreen(false).then(setFullscreen);
       }
     });
-    window.desktop.onPaneBlocked((paneId, statusCode) => {
+    window.desktop.onPaneBlocked((paneId, statusCode, challengeResource) => {
       setRuntimes((current) => {
         const runtime = current[paneId];
         if (!runtime) return current;
-        return { ...current, [paneId]: { ...runtime, playerStatus: statusCode === 412 ? "blocked" : "challenge", cloudflareStatus: statusCode === 412 ? "detected" : runtime.cloudflareStatus, error: `站点拒绝了内嵌请求（HTTP ${statusCode}），可点击“用 Chrome 打开”在真实浏览器中播放` } };
+        const challenge = challengeResource || (statusCode === 412 && (runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped"));
+        return { ...current, [paneId]: { ...runtime, playerStatus: challenge ? "challenge" : "blocked", cloudflareStatus: challenge ? "detected" : runtime.cloudflareStatus, error: challenge ? "站点要求完成 Cloudflare 验证，请在当前分屏完成验证" : `站点拒绝了内嵌请求（HTTP ${statusCode}），可点击“用 Chrome 打开”在真实浏览器中播放` } };
       });
+    });
+    window.desktop.onProxyStatus((value) => {
+      if (!value || typeof value !== "object") return;
+      const statusValue = value as { ok?: unknown; message?: unknown };
+      if (statusValue.ok === false && typeof statusValue.message === "string") setStatus(statusValue.message);
     });
     window.desktop.onChromeSessionError((message) => setStatus(message));
   }, [activePaneId, fullscreen, htmlFullscreen, htmlFullscreenPaneId, interactionMode]);
@@ -813,6 +995,41 @@ export default function App(): ReactElement {
   useEffect(() => {
     void window.desktop.setInteractionMode(interactionMode);
   }, [interactionMode]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(FONT_SCALE_STORAGE_KEY, String(fontScale));
+    } catch {
+    }
+  }, [fontScale]);
+
+  useEffect(() => {
+    void window.desktop.getGlobalProxy().then((saved) => {
+      const value = normalizeGlobalProxySettings(saved);
+      if (value) {
+        setGlobalProxy(value);
+        setGlobalProxyDraft({ ...value, custom: { ...value.custom } });
+      }
+    }).catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    if (!globalProxyOpen) return;
+    const close = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof HTMLElement && target.closest(".global-proxy-popover, .proxy-button")) return;
+      setGlobalProxyOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setGlobalProxyOpen(false);
+    };
+    document.addEventListener("pointerdown", close, true);
+    document.addEventListener("keydown", closeOnEscape, true);
+    return () => {
+      document.removeEventListener("pointerdown", close, true);
+      document.removeEventListener("keydown", closeOnEscape, true);
+    };
+  }, [globalProxyOpen]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -880,6 +1097,11 @@ export default function App(): ReactElement {
     const next = removePane(layout, paneId);
     if (next) { setLayout(next); setStatus("分屏已关闭"); }
   };
+  const swapPanes = (firstPaneId: string, secondPaneId: string) => {
+    if (firstPaneId === secondPaneId) return;
+    setLayout((current) => swapPanePositions(current, firstPaneId, secondPaneId));
+    setStatus("分屏位置已交换");
+  };
   const navigate = (paneId: string, value: string) => {
     const normalized = normalizeUrl(value);
     if (!normalized) { updatePane(paneId, { error: "请输入有效的 http 或 https 视频网址" }); return; }
@@ -899,13 +1121,83 @@ export default function App(): ReactElement {
     setFullscreen(value);
   };
   const toggleInputMode = () => setInteractionMode(toggleInteractionMode);
+  const updatePaneProxy = useCallback((paneId: string, settings: PaneProxySettings) => {
+    const runtime = runtimes[paneId];
+    if (!runtime) return;
+    const transition = resolvePaneProxySession(runtime.sessionMode, runtime.proxyAutoIsolated, settings.mode);
+    if (settings.mode !== "inherit" && runtime.sessionMode === "shared") {
+      updatePane(paneId, {
+        sessionMode: transition.sessionMode,
+        proxy: settings,
+        proxyAutoIsolated: transition.proxyAutoIsolated,
+        userPauseIntent: false,
+        playerStatus: "loading",
+        playback: emptyPlayback(),
+        playing: false,
+        focusModeEnabled: false,
+        cloudflareStatus: "none",
+        error: undefined,
+      });
+      setStatus("分屏代理已启用，已切换独立会话（Cookie 不再共享）");
+      return;
+    }
+    if (settings.mode === "inherit" && runtime.sessionMode === "isolated" && runtime.proxyAutoIsolated) {
+      updatePane(paneId, {
+        sessionMode: transition.sessionMode,
+        proxy: settings,
+        proxyAutoIsolated: transition.proxyAutoIsolated,
+        userPauseIntent: false,
+        playerStatus: "loading",
+        playback: emptyPlayback(),
+        playing: false,
+        focusModeEnabled: false,
+        cloudflareStatus: "none",
+        error: undefined,
+      });
+      setStatus("分屏已恢复跟随全局代理，并重新加入共享会话");
+      return;
+    }
+    updatePane(paneId, { proxy: settings, ...transition, error: undefined });
+    setStatus(settings.mode === "inherit" ? "分屏已跟随全局代理" : "分屏代理已更新");
+  }, [runtimes, updatePane]);
+
+  const saveGlobalProxy = useCallback(async () => {
+    const normalized = normalizeGlobalProxySettings(globalProxyDraft);
+    if (!normalized) {
+      setGlobalProxyError("请输入有效的代理地址和 1–65535 端口");
+      return;
+    }
+    let result: { ok?: boolean; settings?: unknown; message?: string };
+    try {
+      result = await window.desktop.setGlobalProxy(normalized) as { ok?: boolean; settings?: unknown; message?: string };
+    } catch (error) {
+      setGlobalProxyError(error instanceof Error ? error.message : "应用全局代理失败");
+      return;
+    }
+    if (!result.ok) {
+      setGlobalProxyError(result.message || "应用全局代理失败");
+      return;
+    }
+    const applied = normalizeGlobalProxySettings(result.settings) ?? normalized;
+    setGlobalProxy(applied);
+    setGlobalProxyDraft({ ...applied, custom: { ...applied.custom } });
+    setGlobalProxyError(null);
+    setGlobalProxyOpen(false);
+    setStatus(`全局代理已切换为${proxyModeLabel(applied.mode)}`);
+  }, [globalProxyDraft]);
+
+  const openGlobalProxyEditor = () => {
+    setGlobalProxyDraft({ ...globalProxy, custom: { ...globalProxy.custom } });
+    setGlobalProxyError(null);
+    setGlobalProxyOpen((current) => !current);
+  };
 
   return (
-    <div className={`app-shell ${fullscreen ? "is-fullscreen" : ""} ${htmlFullscreen ? "is-html-fullscreen" : ""} ${interactionMode === "app" ? "is-app-input-mode" : "is-web-input-mode"}`}>
-      <header className="app-header"><div className="brand"><div className="brand-mark">▦</div><div><div className="brand-title">同屏播放</div><div className="brand-subtitle">沉浸式多视频工作台</div></div></div><div className="header-actions"><span className={`interaction-mode ${interactionMode}`}>{interactionMode === "web" ? "网页操作" : "应用操作"}</span><button className="header-button" onClick={toggleInputMode}>{interactionMode === "web" ? "切到应用层" : "切回网页层"} · F8</button><span className="pane-count">{paneIds.length}/{MAX_PANES} 格</span><button className="header-button" onClick={() => void toggleFullscreen()}>{fullscreen ? "退出全屏" : "全屏"}</button><button className="header-button" onClick={() => void save()}>保存布局</button><button className="header-button subtle" onClick={() => void clearSession()}>清除登录</button></div></header>
-      <div className="toolbar"><span className="toolbar-label">布局</span><div className="preset-group">{(["single", "split-2", "split-3", "grid-2x2", "grid-3x2"] as Preset[]).map((preset) => <button key={preset} className="preset-button" onClick={() => applyPreset(preset)}>{presetLabel(preset)}</button>)}</div><div className="toolbar-hint">{interactionMode === "web" ? "网页播放器直接接收鼠标和键盘 · F8 切换应用层" : "应用层接管活动分屏 · 鼠标移到底部显示控制"}</div></div>
-      <main className="workspace">{guestPreloadUrl ? <LayoutSurface layout={layout} runtimes={runtimes} activePaneId={activePaneId} interactionMode={interactionMode} guestPreloadUrl={guestPreloadUrl} onActive={setActivePaneId} onNavigate={navigate} onUpdatePane={updatePane} onResize={resizeDivider} onSplit={split} onRemove={closePane} onOpenChrome={(paneId) => void openChrome(paneId)} /> : <div className="loading-state">正在准备网页播放内核…</div>}</main>
-      <footer className="status-bar"><span className="status-dot" /><span>{status}</span><span className="status-spacer" /><span>共享会话 · 安全拦截</span></footer>
+    <div className={`app-shell ${fullscreen ? "is-fullscreen" : ""} ${htmlFullscreen ? "is-html-fullscreen" : ""} ${interactionMode === "app" ? "is-app-input-mode" : "is-web-input-mode"}`} style={{ "--app-font-scale": fontScale } as CSSProperties}>
+       <header className="app-header"><div className="brand"><div className="brand-mark">▦</div><div><div className="brand-title">同屏播放</div><div className="brand-subtitle">沉浸式多视频工作台</div></div></div><div className="header-actions"><span className={`interaction-mode ${interactionMode}`}>{interactionMode === "web" ? "网页操作" : "应用操作"}</span><button className="header-button" onClick={toggleInputMode}>{interactionMode === "web" ? "切到应用层" : "切回网页层"} · F8</button><button className={`header-button proxy-button ${globalProxy.mode === "custom" ? "selected" : ""}`} onClick={openGlobalProxyEditor}>代理：{proxyModeLabel(globalProxy.mode)}</button><label className="font-scale-control"><span>字号</span><select aria-label="应用字号" value={fontScale} onChange={(event) => setFontScale(Number(event.target.value))}>{FONT_SCALE_OPTIONS.map((value) => <option key={value} value={value}>{Math.round(value * 100)}%</option>)}</select></label><span className="pane-count">{paneIds.length}/{MAX_PANES} 格</span><button className="header-button" onClick={() => void toggleFullscreen()}>{fullscreen ? "退出全屏" : "全屏"}</button><button className="header-button" onClick={() => void save()}>保存布局</button><button className="header-button subtle" onClick={() => void clearSession()}>清除登录</button></div>{globalProxyOpen && <div className="proxy-popover global-proxy-popover" onPointerDown={(event) => event.stopPropagation()} role="dialog" aria-label="全局代理设置"><div className="proxy-popover-title">全局代理设置</div><div className="proxy-form-hint">仅影响 Electron 内嵌分屏，不改变外部 Chrome 的网络设置。</div><label className="proxy-mode-field">代理模式<select value={globalProxyDraft.mode} onChange={(event) => setGlobalProxyDraft((current) => ({ ...current, mode: event.target.value as GlobalProxySettings["mode"] }))}><option value="system">系统代理</option><option value="direct">直连（不使用代理）</option><option value="custom">自定义 HTTP</option></select></label>{globalProxyDraft.mode === "custom" && <><label className="proxy-checkbox"><input type="checkbox" checked={globalProxyDraft.mode === "custom"} onChange={(event) => setGlobalProxyDraft((current) => ({ ...current, mode: event.target.checked ? "custom" : "direct" }))} />使用代理服务器</label><ProxyEndpointFields value={globalProxyDraft.custom} onChange={(custom) => setGlobalProxyDraft((current) => ({ ...current, custom }))} /></>}{globalProxyError && <div className="proxy-form-error">{globalProxyError}</div>}<div className="proxy-form-actions"><button className="icon-button" onClick={() => { setGlobalProxyOpen(false); setGlobalProxyError(null); }}>取消</button><button className="icon-button primary" onClick={() => void saveGlobalProxy()}>保存</button></div></div>}</header>
+       <div className="toolbar"><span className="toolbar-label">布局</span><div className="preset-group">{(["single", "split-2", "split-3", "grid-2x2", "grid-3x2"] as Preset[]).map((preset) => <button key={preset} className="preset-button" onClick={() => applyPreset(preset)}>{presetLabel(preset)}</button>)}</div><div className="toolbar-hint">{interactionMode === "web" ? "网页播放器直接接收鼠标和键盘 · F8 切换应用层" : "应用层接管活动分屏 · 鼠标移到底部显示控制"}</div></div>
+       <main className="workspace">{guestPreloadUrl ? <LayoutSurface layout={layout} runtimes={runtimes} activePaneId={activePaneId} interactionMode={interactionMode} guestPreloadUrl={guestPreloadUrl} onActive={setActivePaneId} onNavigate={navigate} onUpdatePane={updatePane} onProxyChange={updatePaneProxy} onResize={resizeDivider} onSwap={swapPanes} onSplit={split} onRemove={closePane} onOpenChrome={(paneId) => void openChrome(paneId)} /> : <div className="loading-state">正在准备网页播放内核…</div>}</main>
+       <footer className="status-bar"><span className="status-dot" /><span>{status}</span><span className="status-spacer" /><span>全局代理：{proxyModeLabel(globalProxy.mode)} · 共享会话 · 安全拦截</span></footer>
       {(fullscreen || htmlFullscreen) && (
         <div className="fullscreen-top-zone">
           <div className="fullscreen-top-bar">

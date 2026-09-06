@@ -1,8 +1,41 @@
+# Dependencies
 node_modules/
+
+# Build and packaging output
 dist/
 dist-electron/
 release/
+coverage/
+.vite/
+*.tsbuildinfo
+
+# Runtime and diagnostic files
 *.log
+*.pid
+*.seed
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+
+# Screenshots and local media captures
 *.png
 *.jpg
 *.jpeg
+*.gif
+*.webp

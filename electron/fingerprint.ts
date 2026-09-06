@@ -111,12 +111,6 @@ export function installFingerprintForSession(targetSession: Session): void {
   });
 }
 
-export function updateFingerprintForSession(targetSession: Session, version: string, userAgent?: string): void {
-  setFingerprintVersion(version);
-  fingerprintInstalledSessions.add(targetSession);
-  targetSession.setUserAgent(userAgent || chromeUserAgent(version), chromeAcceptLanguage());
-}
-
 export function mainWorldFingerprintScript(): string {
   return `(function () {
   "use strict";

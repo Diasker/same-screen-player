@@ -1,56 +1,106 @@
-# 同屏播放
+# 同屏播放 / Same Screen Player
 
-一个基于 Electron 的沉浸式多视频网页播放器：把多个网页视频放进分屏里同屏播放，重点适配 YouTube、bilibili 及其他普通网页视频站。
+同屏播放是一款基于 Electron 的多分屏网页视频工作台。它把多个网页放在同一个窗口中并排播放，适合同时查看 YouTube、bilibili 以及其他支持网页播放的视频站点。
 
-播放内核是 Electron 内嵌 `<webview>`。真实 Chrome 仅作为**兜底手段**使用（「用 Chrome 打开」被拦截的页面、用「Chrome 验证」完成 Cloudflare 验证、用「导入验证」回填通行 Cookie），不再用于分屏播放。
+Same Screen Player is an Electron-based multi-pane web video workspace. It places several web pages in one window so you can watch YouTube, bilibili, and other web video sites side by side.
 
-## 开发
+播放内容使用 Electron 内嵌 `<webview>` 渲染。真实 Chrome 只用于 Google 登录和受 DRM、禁止内嵌或站点风控影响的通用兜底场景，不参与普通分屏播放。
+
+Playback uses embedded Electron `<webview>` elements. The real Chrome browser is used only for Google sign-in and a general fallback for DRM, embedding restrictions, or site risk controls; it is not the normal playback backend.
+
+## 功能 / Features
+
+- 支持单屏、2 格、3 格、4 格（2×2）和 6 格（3×2）布局，分隔线可调整比例。
+- Supports single, 2-pane, 3-pane, 4-pane (2×2), and 6-pane (3×2) layouts with adjustable dividers.
+- 应用操作模式提供播放、暂停、进度、音量、静音、倍速、刷新、分屏、会话和广告拦截控制；网页操作模式保留网站原生控件。
+- App mode provides play, pause, seek, volume, mute, speed, reload, split, session, and ad-block controls; Web mode keeps the site's native controls.
+- 进度条支持按住鼠标实时拖动预览；倍速支持固定选项和 `0.25x`–`4x` 自定义值。
+- The seek bar supports live scrubbing while holding the mouse button; playback speed includes presets and custom values from `0.25x` to `4x`.
+- 应用操作模式下可拖动分屏交换网格位置，右键分屏可以关闭当前分屏，至少保留一个分屏。
+- In App mode, drag a pane to exchange grid positions and right-click a pane to close it; at least one pane is always kept.
+- 每个分屏有独立的后退/前进历史控制；网页操作模式下，`Alt + ←/→` 控制当前分屏历史。
+- Each pane has Back/Forward history controls; in Web mode, `Alt + ←/→` navigates the active pane.
+- 顶部字号支持 `80%`、`90%`、`100%`、`110%`、`125%`、`140%`，设置会持久化且不改变网页内部字体。
+- The top font-size control supports `80%`, `90%`, `100%`, `110%`, `125%`, and `140%`; the choice persists without changing website fonts.
+- 代理支持系统代理、直连和自定义 HTTP；可设置全局代理，也可为分屏覆盖代理。分屏覆盖优先于全局配置。
+- Proxy modes include system proxy, direct connection, and custom HTTP. A global proxy can be overridden per pane, and pane settings take priority.
+- 自定义代理支持地址、端口、例外地址和本地地址绕过；不支持 SOCKS、用户名或密码认证。
+- Custom HTTP proxy settings support host, port, bypass rules, and local-address bypass; SOCKS and proxy authentication are not supported.
+- 默认使用共享登录会话；分屏使用独立代理时会自动切换独立 Session，并提示 Cookie 隔离。
+- Panes share a login session by default. Selecting a pane-specific proxy automatically switches that pane to an isolated Session and warns about Cookie isolation.
+- Cloudflare 挑战资源在 Electron 分屏中保留并放行，指纹伪装帮助多数站点直接完成验证；挑战循环时可以手动重新加载验证页。
+- Cloudflare challenge resources remain available inside Electron panes, while browser fingerprint emulation helps most sites complete verification; looping challenges can be manually reloaded.
+
+## 操作方式 / Usage
+
+### 启动与打开页面 / Start and open pages
+
+- 中文：在空白分屏输入 `http://` 或 `https://` 地址，点击“播放”；顶部布局按钮可以快速切换分屏数量，拖动分隔线可以调整各区域大小。
+- English: Enter an `http://` or `https://` address in an empty pane and click “播放 / Play”. Use the layout buttons to change the pane count and drag dividers to resize areas.
+
+### 两种操作模式 / Interaction modes
+
+- “网页操作”把鼠标和键盘交给网页，适合点击链接、输入文字和使用网站原生播放器。
+- “网页操作 / Web mode” sends mouse and keyboard input to the page for links, text fields, and native players.
+- “应用操作”由应用接管活动分屏，鼠标移到分屏底部显示应用控制栏；按 `F8` 或顶部按钮切换。
+- “应用操作 / App mode” lets the application control the active pane. Move the pointer to the bottom to show controls; press `F8` or use the top button to switch.
+- `F11` 切换应用全屏；`Esc` 按网页全屏、应用操作层、应用全屏的顺序退出。
+- `F11` toggles application fullscreen; `Esc` exits webpage fullscreen, App mode, and application fullscreen in that order.
+
+### 分屏管理 / Pane management
+
+- 在应用操作模式下，从分屏空白区域或网页区域按住左键拖动，可以交换两个分屏的位置。控制按钮、输入框和菜单不会触发拖动。
+- In App mode, hold the left mouse button on a pane's empty or page area to exchange it with another pane. Buttons, inputs, and menus do not start a drag.
+- 在应用操作模式下右键分屏，选择“关闭当前分屏”；单屏时关闭按钮会禁用。
+- In App mode, right-click a pane and choose “关闭当前分屏 / Close current pane”. The action is disabled when only one pane remains.
+- 每格控制栏的会话按钮可在共享 Session 和独立 Session 之间切换。代理覆盖会自动使用独立 Session。
+- The session button in each pane switches between shared and isolated Sessions. A pane proxy override automatically uses an isolated Session.
+
+### 代理设置 / Proxy settings
+
+- 顶部“代理”打开全局设置：`系统代理` 使用 Windows 系统代理/PAC，`直连` 完全不使用代理，`自定义 HTTP` 使用地址和端口。
+- Open “代理 / Proxy” at the top for global settings: `System proxy` follows Windows proxy/PAC, `Direct` bypasses proxies, and `Custom HTTP` uses the configured host and port.
+- 自定义代理的例外地址使用英文分号分隔；勾选本地地址选项后会追加 `<local>` 规则。
+- Separate bypass addresses with English semicolons; enabling local-address bypass adds the `<local>` rule.
+- 分屏选择“跟随全局代理”时实时继承全局设置；选择“分屏直连”或“分屏自定义 HTTP”时覆盖全局设置。
+- “跟随全局代理 / Follow global” tracks global changes in real time; “Pane direct” and “Pane custom HTTP” override the global setting.
+- 全局代理配置保存到应用数据目录；分屏覆盖只在当前运行期间有效，重启后恢复为跟随全局。
+- Global proxy settings are stored in the application data directory. Pane overrides last for the current run and reset to Follow global after restart.
+
+### 登录与受限页面 / Sign-in and restricted pages
+
+- YouTube 和 bilibili 的登录入口会在应用登录窗口打开并复用当前分屏会话；Google 登录使用独立 Chrome 窗口。
+- YouTube and bilibili sign-in entries open an application login window using the current pane session; Google sign-in uses a separate Chrome window.
+- 对 DRM、禁止内嵌或返回 401/403/412/451 的页面，可在应用控制栏选择“用 Chrome 打开”。
+- For DRM, embedding restrictions, or pages returning 401/403/412/451, choose “用 Chrome 打开 / Open in Chrome” from the App controls.
+- Cloudflare 挑战优先在当前 Electron 分屏内完成；应用不再提供 Chrome 验证或 Cookie 导入入口。
+- Cloudflare challenges are handled in the current Electron pane; Chrome verification and Cookie import controls are not provided.
+
+## 开发 / Development
 
 环境要求：Node.js 20 或更高版本、npm。
 
+Requirements: Node.js 20 or newer and npm.
+
 ```bash
 npm install
-npm run build
 npm run dev
 ```
 
-`npm run dev` 会启动 Vite 开发服务器和 Electron 窗口。某些受限网络环境可能禁止本地端口监听，此时仍可使用 `npm run build` 验证生产构建。
+生产构建、测试和安装包命令：
 
-注意：改动主进程或访客预加载脚本后必须重新 `npm run build`，并且要**彻底重启 `npm run dev`**（Ctrl+C 后重跑），页面刷新 / HMR 不会生效。
-
-## 功能说明
-
-- 支持单屏、2 格、3 格、4 格（2×2）和 6 格（3×2）布局，分隔线可拖动，分屏数量最多为 6 格。
-- 默认每格静音；「网页操作」层把鼠标和键盘完整交给网站播放器，保留站点自己的暂停、进度、音量、倍速、画质、字幕和全屏控制。
-- 按 `F8` 切换「应用操作」层；应用层才显示 App 自己的播放/暂停、进度、音量、静音、倍速、刷新、分屏和会话控制栏，鼠标移到底部可显示控制栏。
-- 应用层进度条支持按住鼠标实时拖动预览画面；倍速下拉支持固定选项和 `0.25x`–`4x` 自定义倍速。
-- 每个分屏的应用控制栏都提供独立的「后退」「前进」按钮；网页操作模式下可使用 `Alt + ←/→` 操作当前分屏的浏览历史。
-- 默认进入「网页原始模式」（不干预页面，站点原生布局）；在分屏控制条点「专注模式」可把播放器钉满分屏并隐藏无关内容，同时保留站点原生控制条。
-- 点击「全屏」或按 `F11` 可隐藏标题栏、布局栏和状态栏；`Esc` 按优先级依次退出网页全屏、应用操作层、应用全屏。应用全屏时把鼠标移到顶部边缘可看到退出提示。
-- 默认共享登录会话，也可以将单格切换为独立会话；顶部「清除登录」清空应用会话存储。
-- YouTube/bilibili 的登录弹窗会在应用自己的登录窗口中打开，并复用当前分屏会话。
-- 每格可独立「拦截/放行」广告拦截。
-- 只保存布局，不保存视频网址；登录 Cookie 保存在应用自己的数据目录。
-- 对 DRM、禁止内嵌或被站点风控拦截的页面，可用控制条里的「用 Chrome 打开」交给真实 Chrome 处理（直接以 `--app` 打开，使用你本机 Chrome 的默认配置）。
-- Cloudflare 验证资源（Turnstile、`/cdn-cgi/challenge-platform/` 等）采用精确白名单放行；Electron 后端会自动伪装浏览器指纹（User-Agent、`sec-ch-ua` Client Hints、插件/MIME、`window.chrome` 等），多数站点能在分屏内直接完成验证。验证仍循环时停止自动处理，可手动「重新加载验证页」。
-- 如果站点返回 401 / 403 / 412 / 451，分屏会显示「播放受限」，这通常是站点风控、地区或网络策略，可用「用 Chrome 打开」处理。
-
-## Chrome 兜底（Cloudflare 验证 / 导入验证）
-
-Chrome 不再是播放后端，只用于少数需要完整 Chrome 环境才能通过验证的站点：
-
-- 分屏控制条里的「Chrome 验证」会在一个**专用调试实例**中打开当前页，完成验证后，「导入验证」会把该站的通行 Cookie 回填到 Electron 分屏并刷新。
-- 专用配置永久保存在 `%APPDATA%/same-screen-player/chrome-profile/`，与系统 Chrome 的 `Default` 配置相互独立。
-- Electron 内嵌模式已经能直接完成大多数 Cloudflare 验证；以上仅是极端站点（Cookie 与特定指纹绑定）的兜底。
-
-## 已知问题
-
-- Bilibili 主页支持站内卡片、导航和子域链接跳转；访客页面默认保持网页原始交互，不会把首页预览误识别为专注播放器。
-
-## 构建安装包
+Production build, test, and package commands:
 
 ```bash
+npm run build
+npm test
 npm run dist
 ```
 
-安装包会输出到 `release/`。不同平台需要在对应平台上进行最终签名和发布验证。
+`npm run dev` 会启动 Vite 和 Electron。改动主进程或访客预加载脚本后，请重新运行 `npm run build` 并彻底重启开发进程；仅刷新页面或依赖 HMR 不会重新加载这些脚本。
+
+`npm run dev` starts Vite and Electron. After changing the main process or guest preload, run `npm run build` and fully restart the development process; a page refresh or HMR alone does not reload those scripts.
+
+更多技术结构、目录说明和故障排查请参阅 [开发者文档 / Developer Guide](docs/DEVELOPMENT.md)。
+
+See [开发者文档 / Developer Guide](docs/DEVELOPMENT.md) for the architecture, directory map, and troubleshooting notes.

@@ -4,7 +4,21 @@ import { existsSync, promises as fs } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
-import { isLayoutNode, type InteractionMode, type LayoutNode, type PersistedLayout, type WindowBounds } from "../src/shared/types";
+import {
+  defaultGlobalProxySettings,
+  defaultPaneProxySettings,
+  isLayoutNode,
+  normalizeGlobalProxySettings,
+  normalizePaneProxySettings,
+  resolveProxySettings,
+  toElectronProxySettings,
+  type GlobalProxySettings,
+  type InteractionMode,
+  type LayoutNode,
+  type PaneProxySettings,
+  type PersistedLayout,
+  type WindowBounds,
+} from "../src/shared/types";
 import {
   cloudflareChallengeHost,
   emptyChallengeNavigation,
@@ -14,8 +28,8 @@ import {
   shouldBypassAdblockForChallenge,
   type ChallengeNavigationState,
 } from "./cloudflare";
-import { ChromeSessionManager, isValidChromeUrl } from "./cdp";
-import { chromeUserAgent, installFingerprintForSession, mainWorldFingerprintScript, updateFingerprintForSession } from "./fingerprint";
+import { ChromeSessionManager } from "./cdp";
+import { chromeUserAgent, installFingerprintForSession, mainWorldFingerprintScript } from "./fingerprint";
 import { helperPath, WindowsWindowHelper } from "./windows-helper";
 
 app.userAgentFallback = chromeUserAgent();
@@ -27,6 +41,8 @@ let blocker: ElectronBlocker | null = null;
 let chromeManager: ChromeSessionManager | null = null;
 let windowsHelper: WindowsWindowHelper | null = null;
 const paneWebContents = new Map<number, string>();
+const panePartitions = new Map<string, string>();
+const paneProxySettings = new Map<string, PaneProxySettings>();
 const paneHosts = new Map<string, string>();
 type BeforeInputListener = (event: Electron.Event, input: Electron.Input) => void;
 const guestBindings = new Map<number, { paneId: string; contents: Electron.WebContents; onBeforeInput: BeforeInputListener; onEnterFullscreen: () => void; onLeaveFullscreen: () => void; onNavigate: (event: Electron.Event, url: string) => void; onNavigateInPage: (event: Electron.Event, url: string) => void; onDestroyed: () => void }>();
@@ -38,6 +54,8 @@ const installedBlockingSessions = new WeakSet<Electron.Session>();
 const installedSessionDiagnostics = new WeakSet<Electron.Session>();
 const headerDiagnosticSessions = new WeakSet<Electron.Session>();
 const knownPartitions = new Set<string>(["persist:shared"]);
+const partitionProxyKeys = new Map<string, string>();
+let globalProxySettings: GlobalProxySettings = defaultGlobalProxySettings();
 
 const defaultLayout: PersistedLayout = {
   version: 1,
@@ -46,6 +64,10 @@ const defaultLayout: PersistedLayout = {
 
 function layoutFilePath(): string {
   return path.join(app.getPath("userData"), "layout.json");
+}
+
+function proxySettingsFilePath(): string {
+  return path.join(app.getPath("userData"), "proxy-settings.json");
 }
 
 function isSafeUrl(value: unknown): value is string {
@@ -132,17 +154,6 @@ function isAuthenticationUrl(value: unknown): value is string {
   }
 }
 
-function loginDomainsFor(value: string): string[] {
-  try {
-    const host = new URL(value).hostname.toLowerCase();
-    if (host === "youtube.com" || host.endsWith(".youtube.com") || host === "youtu.be") return ["google.com", "youtube.com"];
-    if (host === "bilibili.com" || host.endsWith(".bilibili.com")) return ["bilibili.com"];
-    return [];
-  } catch {
-    return [];
-  }
-}
-
 function openAuthenticationWindow(value: unknown, partition: unknown): boolean {
   if (!isAuthenticationUrl(value)) return false;
   const safePartition = typeof partition === "string" && /^persist:[a-zA-Z0-9._-]+$/.test(partition) ? partition : "persist:shared";
@@ -192,6 +203,10 @@ async function exitWebpageFullscreen(paneId?: string): Promise<boolean> {
 function sendWindowMessage(channel: string, ...args: unknown[]): void {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.webContents.send(channel, ...args);
+}
+
+function sendProxyStatus(scope: "global" | "pane", ok: boolean, message?: string, paneId?: string): void {
+  sendWindowMessage("proxy:status", { scope, ok, ...(paneId ? { paneId } : {}), ...(message ? { message } : {}) });
 }
 
 function recordCloudflareDiagnostic(paneId: string, url: unknown, status: string, navigationCount: number, httpStatus?: number): void {
@@ -261,6 +276,8 @@ function unbindGuest(webContentsId: number): void {
   binding.contents.removeListener("destroyed", binding.onDestroyed);
   guestBindings.delete(webContentsId);
   paneWebContents.delete(webContentsId);
+  panePartitions.delete(binding.paneId);
+  paneProxySettings.delete(binding.paneId);
   challengeNavigation.delete(binding.paneId);
   challengeModePanes.delete(binding.paneId);
   if (htmlFullscreenPaneId === binding.paneId) {
@@ -371,6 +388,85 @@ async function saveLayout(layout: unknown): Promise<boolean> {
   return true;
 }
 
+async function loadGlobalProxySettings(): Promise<GlobalProxySettings> {
+  try {
+    const raw = JSON.parse(await fs.readFile(proxySettingsFilePath(), "utf8")) as unknown;
+    return normalizeGlobalProxySettings(raw) ?? defaultGlobalProxySettings();
+  } catch {
+    return defaultGlobalProxySettings();
+  }
+}
+
+async function saveGlobalProxySettings(settings: GlobalProxySettings): Promise<void> {
+  await fs.mkdir(path.dirname(proxySettingsFilePath()), { recursive: true });
+  await fs.writeFile(proxySettingsFilePath(), JSON.stringify(settings, null, 2), "utf8");
+}
+
+function proxySettingsKey(settings: GlobalProxySettings): string {
+  return JSON.stringify(settings);
+}
+
+async function applyProxyToPartition(partition: string, settings: GlobalProxySettings, force = false): Promise<void> {
+  const key = proxySettingsKey(settings);
+  if (!force && partitionProxyKeys.get(partition) === key) return;
+  const targetSession = session.fromPartition(partition);
+  await targetSession.setProxy(toElectronProxySettings(settings));
+  await targetSession.closeAllConnections();
+  partitionProxyKeys.set(partition, key);
+}
+
+function reloadContents(contents: Electron.WebContents): void {
+  if (contents.isDestroyed()) return;
+  const performReload = () => {
+    if (contents.isDestroyed()) return;
+    try {
+      contents.reload();
+    } catch {
+    }
+  };
+  try {
+    if (!contents.isLoading()) {
+      performReload();
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const cleanup = () => {
+      contents.removeListener("did-stop-loading", onStopLoading);
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    };
+    const onStopLoading = () => {
+      cleanup();
+      performReload();
+    };
+    contents.once("did-stop-loading", onStopLoading);
+    timer = setTimeout(() => {
+      cleanup();
+      performReload();
+    }, 1500);
+  } catch {
+    performReload();
+  }
+}
+
+function reloadPanesInPartitions(partitions: Set<string>): void {
+  for (const [webContentsId, paneId] of paneWebContents) {
+    const partition = panePartitions.get(paneId);
+    if (!partition || !partitions.has(partition)) continue;
+    const contents = webContents.fromId(webContentsId);
+    if (!contents || contents.isDestroyed()) continue;
+    reloadContents(contents);
+  }
+}
+
+function reloadPane(paneId: string): void {
+  const webContentsId = [...paneWebContents.entries()].find(([, registeredPaneId]) => registeredPaneId === paneId)?.[0];
+  if (webContentsId === undefined) return;
+  const contents = webContents.fromId(webContentsId);
+  if (!contents || contents.isDestroyed()) return;
+  reloadContents(contents);
+}
+
 function collectPaneIds(node: LayoutNode): string[] {
   if (node.kind === "pane") return [node.paneId];
   return [...collectPaneIds(node.first), ...collectPaneIds(node.second)];
@@ -391,59 +487,89 @@ function registerIpc(): void {
     interactionMode = mode;
     return true;
   });
+  ipcMain.handle("proxy:getGlobal", () => globalProxySettings);
+  ipcMain.handle("proxy:setGlobal", async (_event, value: unknown) => {
+    const next = normalizeGlobalProxySettings(value);
+    if (!next) {
+      const message = "代理配置无效，请检查地址、端口和例外地址";
+      sendProxyStatus("global", false, message);
+      return { ok: false, message };
+    }
+    const previous = globalProxySettings;
+    const affectedPartitions = new Set<string>(["persist:shared"]);
+    for (const [paneId, partition] of panePartitions) {
+      const paneProxy = paneProxySettings.get(paneId) ?? defaultPaneProxySettings();
+      if (paneProxy.mode === "inherit") affectedPartitions.add(partition);
+    }
+    try {
+      for (const partition of affectedPartitions) await applyProxyToPartition(partition, next, true);
+      for (const [paneId, partition] of panePartitions) {
+        const paneProxy = paneProxySettings.get(paneId) ?? defaultPaneProxySettings();
+        if (paneProxy.mode === "inherit") affectedPartitions.add(partition);
+      }
+      for (const partition of affectedPartitions) await applyProxyToPartition(partition, next, true);
+      await saveGlobalProxySettings(next);
+      globalProxySettings = next;
+      reloadPanesInPartitions(affectedPartitions);
+      sendProxyStatus("global", true);
+      return { ok: true, settings: next };
+    } catch (error) {
+      for (const partition of affectedPartitions) await applyProxyToPartition(partition, previous, true).catch(() => undefined);
+      const message = error instanceof Error ? error.message : "应用全局代理失败";
+      sendProxyStatus("global", false, message);
+      return { ok: false, message };
+    }
+  });
+  ipcMain.handle("proxy:setPane", async (_event, paneId: unknown, value: unknown) => {
+    if (typeof paneId !== "string") {
+      const message = "无效分屏";
+      sendProxyStatus("pane", false, message);
+      return { ok: false, message };
+    }
+    const next = normalizePaneProxySettings(value);
+    if (!next) {
+      const message = "代理配置无效，请检查地址、端口和例外地址";
+      sendProxyStatus("pane", false, message, paneId);
+      return { ok: false, message };
+    }
+    const partition = panePartitions.get(paneId);
+    if (!partition) {
+      const message = "分屏网页尚未准备好";
+      sendProxyStatus("pane", false, message, paneId);
+      return { ok: false, message };
+    }
+    if (partition === "persist:shared" && next.mode !== "inherit") {
+      const message = "共享会话不能使用独立代理，请先切换为独立会话";
+      sendProxyStatus("pane", false, message, paneId);
+      return { ok: false, message };
+    }
+    const previous = paneProxySettings.get(paneId) ?? defaultPaneProxySettings();
+    const previousEffective = resolveProxySettings(globalProxySettings, previous);
+    const nextEffective = resolveProxySettings(globalProxySettings, next);
+    const effectiveChanged = proxySettingsKey(previousEffective) !== proxySettingsKey(nextEffective)
+      || partitionProxyKeys.get(partition) !== proxySettingsKey(nextEffective);
+    try {
+      paneProxySettings.set(paneId, next);
+      if (effectiveChanged) {
+        await applyProxyToPartition(partition, nextEffective, true);
+        reloadPane(paneId);
+      }
+      sendProxyStatus("pane", true, undefined, paneId);
+      return { ok: true, settings: next };
+    } catch (error) {
+      paneProxySettings.set(paneId, previous);
+      await applyProxyToPartition(partition, resolveProxySettings(globalProxySettings, previous), true).catch(() => undefined);
+      const message = error instanceof Error ? error.message : "应用分屏代理失败";
+      sendProxyStatus("pane", false, message, paneId);
+      return { ok: false, message };
+    }
+  });
   ipcMain.handle("layout:load", () => loadLayout());
   ipcMain.handle("layout:save", (_event, layout: unknown) => saveLayout(layout));
   ipcMain.handle("pane:openInChrome", (_event, value: unknown) => openInChrome(value));
   ipcMain.handle("pane:openAuthWindow", (_event, value: unknown, partition: unknown) => openAuthenticationWindow(value, partition));
   ipcMain.handle("window:exitWebpageFullscreen", (_event, paneId: unknown) => exitWebpageFullscreen(typeof paneId === "string" ? paneId : undefined));
   ipcMain.handle("pane:reportPlaybackState", () => true);
-  ipcMain.handle("chrome:clearProfile", async () => {
-    const manager = ensureChromeManager();
-    if (!manager) return false;
-    await manager.clearProfile();
-    return true;
-  });
-  ipcMain.handle("chrome:harvestClearance", async (_event, paneId: unknown, url: unknown) => {
-    if (typeof paneId !== "string" || !isValidChromeUrl(url)) return { ok: false, message: "无效网址" };
-    const manager = ensureChromeManager();
-    if (!manager) return { ok: false, message: "未找到 Google Chrome" };
-    try {
-      const clearance = await manager.harvestCloudflareCookies(url as string);
-      const loginDomains = loginDomainsFor(url as string);
-      const login = loginDomains.length > 0 ? await manager.harvestCookies(loginDomains) : [];
-      const seen = new Set<string>();
-      const cookies = [...clearance, ...login].filter((cookie) => {
-        const key = `${cookie.domain}|${cookie.name}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
-      return { ok: true, cookies };
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : "读取 Chrome Cookie 失败" };
-    }
-  });
-  ipcMain.handle("chrome:openSolver", async (_event, url: unknown) => {
-    if (!isValidChromeUrl(url)) return { ok: false, message: "无效网址" };
-    const manager = ensureChromeManager();
-    if (!manager) return { ok: false, message: "未找到 Google Chrome" };
-    try {
-      const pane = await manager.launchPane("__solver__", url as string);
-      const display = screen.getPrimaryDisplay();
-      const width = 1080;
-      const height = 720;
-      const bounds: WindowBounds = {
-        x: Math.round(display.workArea.x + (display.workArea.width - width) / 2),
-        y: Math.round(display.workArea.y + (display.workArea.height - height) / 2),
-        width,
-        height,
-      };
-      await manager.applyLayout({ __solver__: bounds });
-      return { ok: true, windowId: pane.windowId };
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : "Chrome 验证窗口启动失败" };
-    }
-  });
   ipcMain.handle("chrome:openLogin", async (_event, url: unknown) => {
     if (!isSafeUrl(url)) return { ok: false, message: "无效网址" };
     const manager = ensureChromeManager();
@@ -464,41 +590,6 @@ function registerIpc(): void {
     } catch (error) {
       return { ok: false, message: error instanceof Error ? error.message : "Chrome 登录窗口启动失败" };
     }
-  });
-  ipcMain.handle("pane:applyClearance", async (_event, partition: unknown, url: unknown, cookies: unknown) => {
-    if (typeof partition !== "string" || !isSafeUrl(url) || !Array.isArray(cookies)) return false;
-    const parsed = new URL(url as string);
-    const targetSession = session.fromPartition(partition);
-    knownPartitions.add(partition);
-    if (chromeManager) {
-      const real = await chromeManager.getChromeVersion();
-      if (real) updateFingerprintForSession(targetSession, real.version, real.userAgent);
-    }
-    let applied = 0;
-    for (const cookie of cookies) {
-      const value = cookie as { name?: unknown; value?: unknown; domain?: unknown; path?: unknown; secure?: unknown; httpOnly?: unknown; expirationDate?: unknown; sameSite?: unknown };
-      if (typeof value.name !== "string" || typeof value.value !== "string") continue;
-      const sameSite = value.sameSite === "no_restriction" || value.sameSite === "lax" || value.sameSite === "strict" ? value.sameSite : "unspecified";
-      const domain = typeof value.domain === "string" && value.domain ? value.domain : parsed.hostname;
-      const host = domain.startsWith(".") ? domain.slice(1) : domain;
-      const cookieUrl = `https://${host}/`;
-      try {
-        await targetSession.cookies.set({
-          url: cookieUrl,
-          name: value.name,
-          value: value.value,
-          domain: typeof value.domain === "string" ? value.domain : undefined,
-          path: typeof value.path === "string" ? value.path : "/",
-          secure: Boolean(value.secure),
-          httpOnly: Boolean(value.httpOnly),
-          expirationDate: typeof value.expirationDate === "number" ? value.expirationDate : undefined,
-          sameSite,
-        });
-        applied += 1;
-      } catch {
-      }
-    }
-    return applied > 0;
   });
   ipcMain.handle("pane:inspectFingerprint", async (_event, paneId: unknown) => {
     if (typeof paneId !== "string") return null;
@@ -576,12 +667,23 @@ function registerIpc(): void {
     recordCloudflareDiagnostic(paneId, value.url, value.status, typeof value.navigationCount === "number" ? value.navigationCount : 0);
     return true;
   });
-  ipcMain.handle("pane:register", (_event, paneId: unknown, webContentsId: unknown, partition: unknown, pageUrl: unknown) => {
+  ipcMain.handle("pane:register", async (_event, paneId: unknown, webContentsId: unknown, partition: unknown, pageUrl: unknown, proxy: unknown) => {
     if (typeof paneId !== "string" || typeof webContentsId !== "number" || typeof partition !== "string") return false;
+    if (partition !== "persist:shared" && partition !== `persist:${paneId}`) return false;
+    const paneProxy = proxy === undefined ? defaultPaneProxySettings() : normalizePaneProxySettings(proxy);
+    if (!paneProxy) return false;
+    if (partition === "persist:shared" && paneProxy.mode !== "inherit") return false;
+    try {
+      await applyProxyToPartition(partition, resolveProxySettings(globalProxySettings, paneProxy));
+    } catch {
+      return false;
+    }
     for (const [registeredWebContentsId, registeredPaneId] of paneWebContents) {
       if (registeredPaneId === paneId && registeredWebContentsId !== webContentsId) unbindGuest(registeredWebContentsId);
     }
     paneWebContents.set(webContentsId, paneId);
+    panePartitions.set(paneId, partition);
+    paneProxySettings.set(paneId, paneProxy);
     bindGuest(paneId, webContentsId);
     if (typeof pageUrl === "string" && isSafeUrl(pageUrl)) {
       try {
@@ -672,7 +774,7 @@ function installSessionDiagnostics(targetSession: Electron.Session): void {
       recordCloudflareDiagnostic(paneId, details.url, "resource-completed", challengeNavigation.get(paneId)?.navigationCount ?? 0, details.statusCode);
     }
     if (details.statusCode !== 412 && (!pageLikeRequest || ![401, 403, 451].includes(details.statusCode))) return;
-    if (paneId) mainWindow?.webContents.send("pane:blocked", paneId, details.statusCode);
+    if (paneId) mainWindow?.webContents.send("pane:blocked", paneId, details.statusCode, challengeResource || trackedChallengePage);
   });
 }
 
@@ -793,6 +895,8 @@ function helperScriptPath(): string {
 
 app.whenReady().then(async () => {
   registerIpc();
+  globalProxySettings = await loadGlobalProxySettings();
+  await applyProxyToPartition("persist:shared", globalProxySettings).catch(() => undefined);
   configureSession(session.fromPartition("persist:shared"));
   windowsHelper = new WindowsWindowHelper(helperScriptPath());
   windowsHelper.start();

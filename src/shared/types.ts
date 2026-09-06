@@ -19,6 +19,33 @@ export type SessionMode = "shared" | "isolated";
 
 export type InteractionMode = "web" | "app";
 
+export type ProxyMode = "system" | "direct" | "custom";
+
+export type PaneProxyMode = "inherit" | "direct" | "custom";
+
+export type HttpProxyEndpoint = {
+  host: string;
+  port: number;
+  bypassList: string;
+  bypassLocal: boolean;
+};
+
+export type GlobalProxySettings = {
+  mode: ProxyMode;
+  custom: HttpProxyEndpoint;
+};
+
+export type PaneProxySettings = {
+  mode: PaneProxyMode;
+  custom: HttpProxyEndpoint;
+};
+
+export type ElectronProxySettings = {
+  mode: "system" | "direct" | "fixed_servers";
+  proxyRules?: string;
+  proxyBypassRules?: string;
+};
+
 export type BrowserBackend = "electron" | "chrome";
 
 export type ChromeStatus = "disabled" | "starting" | "ready" | "challenge" | "crashed" | "closed";
@@ -57,6 +84,8 @@ export type PaneRuntime = {
   userPauseIntent: boolean;
   focusModeEnabled: boolean;
   cloudflareStatus: CloudflareStatus;
+  proxy: PaneProxySettings;
+  proxyAutoIsolated: boolean;
   error?: string;
 };
 
@@ -66,6 +95,91 @@ export type PersistedLayout = {
 };
 
 export const MAX_PANES = 6;
+
+export function defaultHttpProxyEndpoint(): HttpProxyEndpoint {
+  return { host: "", port: 8080, bypassList: "", bypassLocal: true };
+}
+
+export function defaultGlobalProxySettings(): GlobalProxySettings {
+  return { mode: "system", custom: defaultHttpProxyEndpoint() };
+}
+
+export function defaultPaneProxySettings(): PaneProxySettings {
+  return { mode: "inherit", custom: defaultHttpProxyEndpoint() };
+}
+
+function normalizeBypassList(value: unknown): string | null {
+  if (typeof value !== "string" || value.length > 4096) return null;
+  const entries = value.split(";").map((entry) => entry.trim()).filter(Boolean);
+  if (entries.some((entry) => {
+    if (/[\u0000-\u001f\u007f]/.test(entry) || entry.includes("/") || entry.includes("\\")) return true;
+    if (entry.toLowerCase() === "<local>") return false;
+    return !/^[a-zA-Z0-9*?.:_\-[\]]+$/.test(entry);
+  })) return null;
+  const uniqueEntries: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    const key = entry.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniqueEntries.push(entry);
+  }
+  return uniqueEntries.join(";");
+}
+
+export function normalizeHttpProxyEndpoint(value: unknown): HttpProxyEndpoint | null {
+  if (!value || typeof value !== "object") return null;
+  const source = value as Record<string, unknown>;
+  if (typeof source.host !== "string" || source.host.trim().length === 0 || source.host.trim().length > 253) return null;
+  const host = source.host.trim();
+  const validHost = /^[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?$/.test(host) || /^\[[0-9a-fA-F:]+\]$/.test(host);
+  if (!validHost || host.includes("/") || host.includes("\\")) return null;
+  const port = typeof source.port === "number" ? source.port : typeof source.port === "string" && /^\d+$/.test(source.port.trim()) ? Number(source.port.trim()) : NaN;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  const bypassList = normalizeBypassList(source.bypassList);
+  if (bypassList === null || typeof source.bypassLocal !== "boolean") return null;
+  return { host, port, bypassList, bypassLocal: source.bypassLocal };
+}
+
+export function normalizeGlobalProxySettings(value: unknown): GlobalProxySettings | null {
+  if (!value || typeof value !== "object") return null;
+  const source = value as Record<string, unknown>;
+  if (source.mode !== "system" && source.mode !== "direct" && source.mode !== "custom") return null;
+  const custom = normalizeHttpProxyEndpoint(source.custom) ?? (source.mode === "custom" ? null : defaultHttpProxyEndpoint());
+  if (!custom) return null;
+  return { mode: source.mode, custom };
+}
+
+export function normalizePaneProxySettings(value: unknown): PaneProxySettings | null {
+  if (!value || typeof value !== "object") return null;
+  const source = value as Record<string, unknown>;
+  if (source.mode !== "inherit" && source.mode !== "direct" && source.mode !== "custom") return null;
+  const custom = normalizeHttpProxyEndpoint(source.custom) ?? (source.mode === "custom" ? null : defaultHttpProxyEndpoint());
+  if (!custom) return null;
+  return { mode: source.mode, custom };
+}
+
+export function resolveProxySettings(global: GlobalProxySettings, pane: PaneProxySettings): GlobalProxySettings {
+  if (pane.mode === "inherit") return global;
+  if (pane.mode === "direct") return { mode: "direct", custom: pane.custom };
+  return { mode: "custom", custom: pane.custom };
+}
+
+export function resolvePaneProxySession(sessionMode: SessionMode, proxyAutoIsolated: boolean, paneProxyMode: PaneProxyMode): { sessionMode: SessionMode; proxyAutoIsolated: boolean } {
+  if (paneProxyMode !== "inherit" && sessionMode === "shared") return { sessionMode: "isolated", proxyAutoIsolated: true };
+  if (paneProxyMode === "inherit" && sessionMode === "isolated" && proxyAutoIsolated) return { sessionMode: "shared", proxyAutoIsolated: false };
+  return { sessionMode, proxyAutoIsolated: sessionMode === "isolated" && proxyAutoIsolated };
+}
+
+export function toElectronProxySettings(settings: GlobalProxySettings): ElectronProxySettings {
+  if (settings.mode === "system") return { mode: "system" };
+  if (settings.mode === "direct") return { mode: "direct" };
+  const endpoint = `${settings.custom.host}:${settings.custom.port}`;
+  const bypassEntries = settings.custom.bypassList.split(";").map((entry) => entry.trim()).filter(Boolean);
+  if (settings.custom.bypassLocal && !bypassEntries.some((entry) => entry.toLowerCase() === "<local>")) bypassEntries.push("<local>");
+  const bypass = bypassEntries.join(";");
+  return { mode: "fixed_servers", proxyRules: `http=${endpoint};https=${endpoint}`, ...(bypass ? { proxyBypassRules: bypass } : {}) };
+}
 
 export function isLayoutNode(value: unknown): value is LayoutNode {
   if (!value || typeof value !== "object") return false;
@@ -132,6 +246,21 @@ export function splitPane(node: LayoutNode, paneId: string, orientation: Orienta
     return split(node, { kind: "pane", paneId: createPaneId() }, orientation);
   }
   return { ...node, first: splitPane(node.first, paneId, orientation), second: splitPane(node.second, paneId, orientation) };
+}
+
+export function swapPanePositions(node: LayoutNode, firstPaneId: string, secondPaneId: string): LayoutNode {
+  if (firstPaneId === secondPaneId) return node;
+  const paneIds = getPaneIds(node);
+  if (!paneIds.includes(firstPaneId) || !paneIds.includes(secondPaneId)) return node;
+  const replace = (current: LayoutNode): LayoutNode => {
+    if (current.kind === "pane") {
+      if (current.paneId === firstPaneId) return { ...current, paneId: secondPaneId };
+      if (current.paneId === secondPaneId) return { ...current, paneId: firstPaneId };
+      return current;
+    }
+    return { ...current, first: replace(current.first), second: replace(current.second) };
+  };
+  return replace(node);
 }
 
 export function removePane(node: LayoutNode, paneId: string): LayoutNode | null {

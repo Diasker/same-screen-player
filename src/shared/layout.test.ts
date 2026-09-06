@@ -5,6 +5,7 @@ import {
   removePane,
   setRatioAtPath,
   splitPane,
+  swapPanePositions,
 } from "./types";
 
 describe("layout model", () => {
@@ -31,5 +32,13 @@ describe("layout model", () => {
     const remaining = removePane(split, ids[1]);
     expect(remaining).not.toBeNull();
     expect(getPaneIds(remaining!)).toEqual(["pane-1"]);
+  });
+
+  it("swaps pane positions without changing pane ids or count", () => {
+    const layout = createPreset("grid-2x2");
+    const swapped = swapPanePositions(layout, "pane-1", "pane-4");
+    expect(getPaneIds(swapped)).toEqual(["pane-4", "pane-2", "pane-3", "pane-1"]);
+    expect(getPaneIds(swapped).sort()).toEqual(getPaneIds(layout).sort());
+    expect(swapPanePositions(layout, "missing", "pane-1")).toEqual(layout);
   });
 });
