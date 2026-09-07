@@ -10,6 +10,7 @@ import {
   isLayoutNode,
   normalizeGlobalProxySettings,
   normalizeHttpProxyEndpoint,
+  normalizeNetworkUrl,
   removePane,
   resolvePaneProxySession,
   setRatioAtPath,
@@ -90,6 +91,7 @@ function makeRuntime(paneId: string): PaneRuntime {
   return {
     paneId,
     url: "",
+    mediaSource: "network",
     sessionMode: "shared",
     muted: true,
     adblockEnabled: true,
@@ -104,18 +106,9 @@ function makeRuntime(paneId: string): PaneRuntime {
   };
 }
 
-function normalizeUrl(value: string): string | null {
-  const trimmed = value.trim();
-  if (!trimmed || trimmed.length > 4096) return null;
-  const candidate = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
-  try {
-    const parsed = new URL(candidate);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
-    return parsed.toString();
-  } catch {
-    return null;
-  }
-}
+type LocalVideoSelection =
+  | { ok: true; url: string; fileName: string }
+  | { ok: false; canceled: boolean; message?: string };
 
 function hostFromUrl(value: string): string | null {
   try {
@@ -252,6 +245,7 @@ function PaneView(props: PaneViewProps): ReactElement {
   activeRef.current = props.active;
   onUpdateRef.current = props.onUpdate;
   onActiveRef.current = props.onActive;
+  const isLocalVideo = runtime.mediaSource === "local";
 
   const hideControls = useCallback(() => {
     if (controlsHideTimerRef.current !== null) window.clearTimeout(controlsHideTimerRef.current);
@@ -305,7 +299,7 @@ function PaneView(props: PaneViewProps): ReactElement {
     }
   }, [navigationState.canGoBack, navigationState.canGoForward]);
 
-  useEffect(() => setDraftUrl(runtime.url), [runtime.url]);
+  useEffect(() => setDraftUrl(runtime.mediaSource === "local" ? runtime.localFileName ?? "" : runtime.url), [runtime.localFileName, runtime.mediaSource, runtime.url]);
 
   useEffect(() => {
     const webview = webviewRef.current;
@@ -319,16 +313,17 @@ function PaneView(props: PaneViewProps): ReactElement {
   }, [props.active, runtime.muted, runtime.focusModeEnabled]);
 
   useEffect(() => {
-    void window.desktop.setChallengeMode(runtime.paneId, runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped");
-  }, [runtime.paneId, runtime.cloudflareStatus]);
+    void window.desktop.setChallengeMode(runtime.paneId, !isLocalVideo && (runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped"));
+  }, [runtime.paneId, runtime.cloudflareStatus, isLocalVideo]);
 
   useEffect(() => {
+    if (runtime.mediaSource === "local") return;
     if (runtime.cloudflareStatus !== "detected" && runtime.cloudflareStatus !== "looped") return;
     const timer = window.setTimeout(() => {
       void window.desktop.inspectFingerprint(runtime.paneId);
     }, 3500);
     return () => window.clearTimeout(timer);
-  }, [runtime.paneId, runtime.cloudflareStatus]);
+  }, [runtime.paneId, runtime.cloudflareStatus, runtime.mediaSource]);
 
   useEffect(() => {
     if (props.interactionMode === "web") hideControls();
@@ -339,25 +334,33 @@ function PaneView(props: PaneViewProps): ReactElement {
   }, [runtime.proxy.custom]);
 
   useEffect(() => {
+    if (runtime.mediaSource === "local") return;
     const webview = webviewRef.current;
     if (!webview || !webviewReadyRef.current || !runtime.url) return;
     void window.desktop.setPaneProxy(runtime.paneId, runtime.proxy).then((result) => {
       const value = result as { ok?: boolean; message?: string };
       if (!value.ok) props.onUpdate({ error: value.message || "应用分屏代理失败" });
     }).catch((error) => props.onUpdate({ error: error instanceof Error ? error.message : "应用分屏代理失败" }));
-  }, [runtime.paneId, runtime.proxy, runtime.url, partition]);
+  }, [runtime.paneId, runtime.proxy, runtime.url, partition, runtime.mediaSource]);
 
   useEffect(() => {
     const webview = webviewRef.current;
     if (!webview || !runtime.url || !webviewReadyRef.current) return;
     navigationRequestedRef.current = true;
+    if (runtime.mediaSource === "local") {
+      void window.desktop.loadLocalVideo(runtime.paneId, runtime.url).then((result) => {
+        const value = result as { ok?: boolean; message?: string };
+        if (!value.ok) onUpdateRef.current({ playerStatus: "blocked", error: value.message || "本地视频无法加载" });
+      }).catch(() => onUpdateRef.current({ playerStatus: "blocked", error: "本地视频无法加载" }));
+      return;
+    }
     try {
       void webview.loadURL(runtime.url).catch(() => undefined);
     } catch {
       webviewReadyRef.current = false;
       navigationRequestedRef.current = false;
     }
-  }, [runtime.url, runtime.sessionMode]);
+  }, [runtime.mediaSource, runtime.paneId, runtime.sessionMode, runtime.url]);
 
   useEffect(() => {
     const webview = webviewRef.current;
@@ -448,7 +451,7 @@ function PaneView(props: PaneViewProps): ReactElement {
         }
         webviewReadyRef.current = true;
         syncNavigationState();
-        void window.desktop.setChallengeMode(currentRuntime.paneId, currentRuntime.cloudflareStatus === "detected" || currentRuntime.cloudflareStatus === "looped");
+        void window.desktop.setChallengeMode(currentRuntime.paneId, currentRuntime.mediaSource !== "local" && (currentRuntime.cloudflareStatus === "detected" || currentRuntime.cloudflareStatus === "looped"));
         try {
           webview.send("pane-activity", activeRef.current);
           webview.send("set-mute", currentRuntime.muted);
@@ -458,6 +461,13 @@ function PaneView(props: PaneViewProps): ReactElement {
         const latestRuntime = runtimeRef.current;
         if (latestRuntime.url && !navigationRequestedRef.current) {
           navigationRequestedRef.current = true;
+          if (latestRuntime.mediaSource === "local") {
+            void window.desktop.loadLocalVideo(latestRuntime.paneId, latestRuntime.url).then((result) => {
+              const value = result as { ok?: boolean; message?: string };
+              if (!value.ok) onUpdateRef.current({ playerStatus: "blocked", error: value.message || "本地视频无法加载" });
+            }).catch(() => onUpdateRef.current({ playerStatus: "blocked", error: "本地视频无法加载" }));
+            return;
+          }
           try {
             void webview.loadURL(latestRuntime.url).catch(() => undefined);
           } catch {
@@ -469,13 +479,14 @@ function PaneView(props: PaneViewProps): ReactElement {
     };
     const onNavigation = (event: Event) => {
       const navigation = event as Event & { url?: string };
-      if (typeof navigation.url === "string" && /^https?:\/\//i.test(navigation.url)) setDraftUrl(navigation.url);
+      if (runtimeRef.current.mediaSource === "network" && typeof navigation.url === "string" && /^https?:\/\//i.test(navigation.url)) setDraftUrl(navigation.url);
       window.setTimeout(syncNavigationState, 0);
     };
     const onFailedLoad = (event: Event) => {
       const failure = event as Event & { errorDescription?: string; errorCode?: number; isMainFrame?: boolean };
       if (failure.isMainFrame === false || failure.errorCode === -3) return;
-      onUpdateRef.current({ playerStatus: "blocked", error: failure.errorDescription || "页面加载失败" });
+      const localFailure = runtimeRef.current.mediaSource === "local";
+      onUpdateRef.current({ playerStatus: "blocked", error: localFailure ? "本地视频无法加载，请确认文件未被删除、可访问且编码受支持" : failure.errorDescription || "页面加载失败" });
     };
     const onProcessGone = () => onUpdateRef.current({ playerStatus: "crashed", error: "网页进程已崩溃，请重新加载" });
     const onNewWindow = (event: Event) => {
@@ -550,14 +561,25 @@ function PaneView(props: PaneViewProps): ReactElement {
   }, [props.active, props.interactionMode, navigateHistory]);
 
   const submitUrl = () => {
-    const normalized = normalizeUrl(draftUrl);
+    const normalized = normalizeNetworkUrl(draftUrl);
     if (!normalized) {
       props.onUpdate({ error: "请输入有效的 http 或 https 视频网址" });
       return;
     }
     setNavigationState({ canGoBack: false, canGoForward: false });
-    props.onUpdate({ url: normalized, error: undefined, playerStatus: "loading", playback: emptyPlayback(), playing: false, userPauseIntent: false, focusModeEnabled: false, cloudflareStatus: "none" });
+    props.onUpdate({ url: normalized, mediaSource: "network", localFileName: undefined, error: undefined, playerStatus: "loading", playback: emptyPlayback(), playing: false, userPauseIntent: false, focusModeEnabled: false, cloudflareStatus: "none" });
     props.onNavigate(normalized);
+    setShowControls(false);
+  };
+  const selectLocalVideo = async () => {
+    const result = await window.desktop.selectLocalVideo() as LocalVideoSelection;
+    if (!result.ok) {
+      if (!result.canceled) props.onUpdate({ error: result.message || "无法打开本地视频" });
+      return;
+    }
+    setDraftUrl(result.fileName);
+    setNavigationState({ canGoBack: false, canGoForward: false });
+    props.onUpdate({ url: result.url, mediaSource: "local", localFileName: result.fileName, error: undefined, playerStatus: "loading", playback: emptyPlayback(), playing: false, userPauseIntent: false, focusModeEnabled: false, cloudflareStatus: "none" });
     setShowControls(false);
   };
   const sendCommand = (command: unknown) => webviewRef.current?.send("video-command", command);
@@ -586,6 +608,7 @@ function PaneView(props: PaneViewProps): ReactElement {
     webviewRef.current?.send("set-focus-mode", enabled);
   };
   const openLogin = () => {
+    if (isLocalVideo) return;
     const loginUrl = authenticationUrlFor(runtime.url);
     if (!loginUrl) return;
     if (/accounts\.google\.com/i.test(loginUrl)) {
@@ -620,6 +643,7 @@ function PaneView(props: PaneViewProps): ReactElement {
     if (Number.isFinite(parsed)) sendCommand({ type: "setRate", value: parsed });
   };
   const toggleAdblock = async () => {
+    if (isLocalVideo) return;
     const host = hostFromUrl(runtime.url);
     const enabled = !runtime.adblockEnabled;
     if (host) await window.desktop.setAdblock(runtime.paneId, host, enabled);
@@ -628,7 +652,7 @@ function PaneView(props: PaneViewProps): ReactElement {
     webviewRef.current?.reload();
   };
   const reloadPane = () => {
-    void window.desktop.setChallengeMode(runtime.paneId, false);
+    if (!isLocalVideo) void window.desktop.setChallengeMode(runtime.paneId, false);
     props.onUpdate({ userPauseIntent: false, playerStatus: "loading", cloudflareStatus: "none", error: undefined });
     webviewRef.current?.reload();
   };
@@ -637,6 +661,7 @@ function PaneView(props: PaneViewProps): ReactElement {
     if (reloaded) props.onUpdate({ cloudflareStatus: "detected", playerStatus: "loading", error: undefined, userPauseIntent: false });
   };
   const toggleSessionMode = () => {
+    if (isLocalVideo) return;
     if (runtime.sessionMode === "isolated" && runtime.proxy.mode !== "inherit") {
       props.onUpdate({ error: "请先将分屏代理改为“跟随全局”，再切换共享会话" });
       return;
@@ -685,9 +710,10 @@ function PaneView(props: PaneViewProps): ReactElement {
       ) : (
         <div className="empty-pane">
           <div className="empty-icon">＋</div>
-          <div className="empty-title">添加视频流</div>
-          <div className="empty-subtitle">输入 YouTube、bilibili 或其他网页视频地址</div>
+          <div className="empty-title">添加视频</div>
+          <div className="empty-subtitle">输入网页视频地址，或选择本地视频文件</div>
           <UrlEditor value={draftUrl} onChange={setDraftUrl} onSubmit={submitUrl} placeholder="粘贴视频网址…" />
+          <button className="local-video-button" onClick={() => void selectLocalVideo()}>打开本地视频</button>
         </div>
       )}
       {runtime.url && props.interactionMode === "app" && <div className="pane-control-trigger" onPointerEnter={revealControls} onPointerLeave={(event) => {
@@ -714,27 +740,26 @@ function PaneView(props: PaneViewProps): ReactElement {
             </div>
           )}
           <div className="pane-url-row">
-            <button className="icon-button history-button" onClick={() => navigateHistory("back")} disabled={!navigationState.canGoBack} aria-label="后退" title="后退">后退</button>
-            <button className="icon-button history-button" onClick={() => navigateHistory("forward")} disabled={!navigationState.canGoForward} aria-label="前进" title="前进">前进</button>
-            <input aria-label="视频网址" value={draftUrl} onChange={(event) => setDraftUrl(event.target.value)} onKeyDown={(event) => event.key === "Enter" && submitUrl()} placeholder="输入视频网址…" />
-            <button className="icon-button primary" onClick={submitUrl}>打开</button>
+            {isLocalVideo ? <div className="local-file-label" title={runtime.localFileName}>{runtime.localFileName || "本地视频"}</div> : <><button className="icon-button history-button" onClick={() => navigateHistory("back")} disabled={!navigationState.canGoBack} aria-label="后退" title="后退">后退</button><button className="icon-button history-button" onClick={() => navigateHistory("forward")} disabled={!navigationState.canGoForward} aria-label="前进" title="前进">前进</button><input aria-label="视频网址" value={draftUrl} onChange={(event) => setDraftUrl(event.target.value)} onKeyDown={(event) => event.key === "Enter" && submitUrl()} placeholder="输入视频网址…" /><button className="icon-button primary" onClick={submitUrl}>打开</button></>}
           </div>
           <div className="pane-actions">
             <button className="icon-button" onClick={() => { sendCommand({ type: "pause" }); props.onUpdate({ userPauseIntent: true }); }}>暂停</button>
             <button className="icon-button" onClick={reloadPane}>刷新</button>
-            <button className={`icon-button ${runtime.adblockEnabled ? "selected" : "warning"}`} onClick={() => void toggleAdblock()}>{runtime.adblockEnabled ? "拦截" : "放行"}</button>
+            <button className="icon-button" onClick={() => void selectLocalVideo()}>本地视频</button>
+            {!isLocalVideo && <button className={`icon-button ${runtime.adblockEnabled ? "selected" : "warning"}`} onClick={() => void toggleAdblock()}>{runtime.adblockEnabled ? "拦截" : "放行"}</button>}
             <button className="icon-button" onClick={() => props.onSplit("horizontal")}>左右分屏</button>
             <button className="icon-button" onClick={() => props.onSplit("vertical")}>上下分屏</button>
-            <button className="icon-button" onClick={toggleSessionMode} disabled={runtime.sessionMode === "isolated" && runtime.proxy.mode !== "inherit"} title={runtime.sessionMode === "isolated" && runtime.proxy.mode !== "inherit" ? "请先改为跟随全局代理" : undefined}>{runtime.sessionMode === "shared" ? "共享会话" : "独立会话"}</button>
-            {authenticationUrlFor(runtime.url) && <button className="icon-button" onClick={openLogin}>登录</button>}
+            {!isLocalVideo && <button className="icon-button" onClick={toggleSessionMode} disabled={runtime.sessionMode === "isolated" && runtime.proxy.mode !== "inherit"} title={runtime.sessionMode === "isolated" && runtime.proxy.mode !== "inherit" ? "请先改为跟随全局代理" : undefined}>{runtime.sessionMode === "shared" ? "共享会话" : "独立会话"}</button>}
+            {!isLocalVideo && authenticationUrlFor(runtime.url) && <button className="icon-button" onClick={openLogin}>登录</button>}
             <button className={`icon-button ${runtime.focusModeEnabled ? "selected" : "warning"}`} onClick={toggleFocusMode}>{runtime.focusModeEnabled ? "专注模式" : "网页原始模式"}</button>
-            <select className="pane-proxy-select" aria-label="分屏代理" value={runtime.proxy.mode} onChange={(event) => chooseProxyMode(event.target.value as PaneProxyMode)}>
+            {!isLocalVideo && <select className="pane-proxy-select" aria-label="分屏代理" value={runtime.proxy.mode} onChange={(event) => chooseProxyMode(event.target.value as PaneProxyMode)}>
               <option value="inherit">跟随全局代理</option>
               <option value="direct">分屏直连</option>
               <option value="custom">分屏自定义 HTTP</option>
             </select>
-            {(runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped") && <button className="icon-button warning" onClick={() => void reloadChallenge()}>重新加载验证页</button>}
-            {runtime.playerStatus === "blocked" && <button className="icon-button warning" onClick={props.onOpenChrome}>用 Chrome 打开</button>}
+            }
+            {!isLocalVideo && (runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped") && <button className="icon-button warning" onClick={() => void reloadChallenge()}>重新加载验证页</button>}
+            {!isLocalVideo && runtime.playerStatus === "blocked" && <button className="icon-button warning" onClick={props.onOpenChrome}>用 Chrome 打开</button>}
             <button className="icon-button" onClick={hideControls}>收起</button>
             <button className="icon-button danger" onClick={props.onRemove}>关闭</button>
           </div>
@@ -747,7 +772,7 @@ function PaneView(props: PaneViewProps): ReactElement {
           {renderIssue && <div className="pane-error">视频层渲染异常；可切换“网页原始模式”恢复站点原生布局。</div>}
         </div>
       )}
-      {runtime.url && props.interactionMode === "app" && proxyEditorOpen && (
+      {runtime.url && !isLocalVideo && props.interactionMode === "app" && proxyEditorOpen && (
         <div className="proxy-popover pane-proxy-popover" onPointerDown={(event) => event.stopPropagation()} role="dialog" aria-label="分屏代理设置">
           <div className="proxy-popover-title">分屏自定义 HTTP 代理</div>
           {runtime.sessionMode === "shared" && <div className="proxy-form-hint warning">保存后会自动切换到独立会话，此分屏将不再共享 Cookie。</div>}
@@ -760,10 +785,11 @@ function PaneView(props: PaneViewProps): ReactElement {
       {runtime.url && props.interactionMode === "web" && (runtime.error || runtime.playerStatus === "unrecognized" || runtime.playerStatus === "challenge" || runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped") && (
         <div className="pane-notice">
           <span>{runtime.cloudflareStatus === "detected" ? "检测到 Cloudflare 验证，已放行验证资源，请在当前页面完成验证。" : runtime.cloudflareStatus === "looped" ? "验证仍在循环，应用已停止自动刷新。" : runtime.error || (runtime.playerStatus === "challenge" ? "请在当前分屏完成 Cloudflare 验证" : "无法识别播放器，已保留网页兼容画面")}</span>
-          {(runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped") && <button className="icon-button warning" onClick={() => void reloadChallenge()}>重新加载验证页</button>}
-          {runtime.playerStatus === "blocked" && <button className="icon-button warning" onClick={props.onOpenChrome}>用 Chrome 打开</button>}
+          {!isLocalVideo && (runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped") && <button className="icon-button warning" onClick={() => void reloadChallenge()}>重新加载验证页</button>}
+          {!isLocalVideo && runtime.playerStatus === "blocked" && <button className="icon-button warning" onClick={props.onOpenChrome}>用 Chrome 打开</button>}
         </div>
       )}
+      {runtime.url && props.interactionMode === "web" && <button className="local-video-quick-button" onPointerDown={(event) => event.stopPropagation()} onClick={() => void selectLocalVideo()}>本地视频</button>}
       {runtime.url && props.interactionMode === "app" && !showControls && <button className="pane-badge" onPointerDown={(event) => event.stopPropagation()} onClick={revealControls}>{runtime.error ? "播放受限" : runtime.playerStatus === "unrecognized" ? "播放器未识别" : runtime.playing ? "播放中" : "已暂停"} · 控制</button>}
     </div>
   );
@@ -1103,9 +1129,9 @@ export default function App(): ReactElement {
     setStatus("分屏位置已交换");
   };
   const navigate = (paneId: string, value: string) => {
-    const normalized = normalizeUrl(value);
+    const normalized = normalizeNetworkUrl(value);
     if (!normalized) { updatePane(paneId, { error: "请输入有效的 http 或 https 视频网址" }); return; }
-    updatePane(paneId, { url: normalized, error: undefined, playerStatus: "loading", playback: emptyPlayback(), playing: false, userPauseIntent: false, focusModeEnabled: false, cloudflareStatus: "none" });
+    updatePane(paneId, { url: normalized, mediaSource: "network", localFileName: undefined, error: undefined, playerStatus: "loading", playback: emptyPlayback(), playing: false, userPauseIntent: false, focusModeEnabled: false, cloudflareStatus: "none" });
   };
   const openChrome = async (paneId: string) => {
     const url = runtimes[paneId]?.url;

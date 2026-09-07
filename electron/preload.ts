@@ -49,6 +49,8 @@ contextBridge.exposeInMainWorld("desktop", {
   },
   loadLayout: (): Promise<unknown> => ipcRenderer.invoke("layout:load"),
   saveLayout: (layout: unknown): Promise<boolean> => ipcRenderer.invoke("layout:save", layout),
+  selectLocalVideo: (): Promise<unknown> => ipcRenderer.invoke("pane:selectLocalVideo"),
+  loadLocalVideo: (paneId: string, url: string): Promise<unknown> => ipcRenderer.invoke("pane:loadLocalVideo", paneId, url),
   clearSession: (): Promise<boolean> => ipcRenderer.invoke("session:clear"),
   registerPane: (paneId: string, webContentsId: number, partition: string, pageUrl?: string, proxy?: unknown): Promise<boolean> =>
     ipcRenderer.invoke("pane:register", paneId, webContentsId, partition, pageUrl, proxy),

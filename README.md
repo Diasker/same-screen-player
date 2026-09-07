@@ -30,13 +30,19 @@ Playback uses embedded Electron `<webview>` elements. The real Chrome browser is
 - Panes share a login session by default. Selecting a pane-specific proxy automatically switches that pane to an isolated Session and warns about Cookie isolation.
 - Cloudflare 挑战资源在 Electron 分屏中保留并放行，指纹伪装帮助多数站点直接完成验证；挑战循环时可以手动重新加载验证页。
 - Cloudflare challenge resources remain available inside Electron panes, while browser fingerprint emulation helps most sites complete verification; looping challenges can be manually reloaded.
+- 可通过系统文件选择器播放单个本地 MP4、M4V、WebM、MOV 或 OGV 视频，并使用现有播放、进度、音量和倍速控制。
+- Use the system file picker to play one local MP4, M4V, WebM, MOV, or OGV video with the existing play, seek, volume, and speed controls.
 
 ## 操作方式 / Usage
 
 ### 启动与打开页面 / Start and open pages
 
-- 中文：在空白分屏输入 `http://` 或 `https://` 地址，点击“播放”；顶部布局按钮可以快速切换分屏数量，拖动分隔线可以调整各区域大小。
-- English: Enter an `http://` or `https://` address in an empty pane and click “播放 / Play”. Use the layout buttons to change the pane count and drag dividers to resize areas.
+- 中文：在空白分屏输入 `http://` 或 `https://` 地址并点击“播放”，或点击“打开本地视频”选择一个本机文件。播放时可从应用控制栏选择“本地视频”替换内容；网页操作模式下，每格右上角也有同名快捷按钮。
+- English: Enter an `http://` or `https://` address in an empty pane and click “播放 / Play”, or use “打开本地视频 / Open local video” to select a file. Replace a playing pane from App controls or the top-right shortcut in Web mode.
+
+本地视频仅支持 MP4、M4V、WebM、MOV 和 OGV 容器；具体编码取决于 Electron 内置 Chromium。文件路径不会保存到布局，重启后不会自动重新打开本地视频。
+
+Local video selection accepts MP4, M4V, WebM, MOV, and OGV containers; actual codec support depends on Electron's embedded Chromium. File paths are never saved in the layout, so local videos do not reopen after restart.
 
 ### 两种操作模式 / Interaction modes
 

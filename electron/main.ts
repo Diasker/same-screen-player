@@ -1,13 +1,14 @@
-import { app, BrowserWindow, ipcMain, screen, session, webContents } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, screen, session, webContents } from "electron";
 import { ElectronBlocker } from "@ghostery/adblocker-electron";
 import { existsSync, promises as fs } from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import {
   defaultGlobalProxySettings,
   defaultPaneProxySettings,
   isLayoutNode,
+  isSupportedLocalVideoFile,
   normalizeGlobalProxySettings,
   normalizePaneProxySettings,
   resolveProxySettings,
@@ -45,7 +46,8 @@ const panePartitions = new Map<string, string>();
 const paneProxySettings = new Map<string, PaneProxySettings>();
 const paneHosts = new Map<string, string>();
 type BeforeInputListener = (event: Electron.Event, input: Electron.Input) => void;
-const guestBindings = new Map<number, { paneId: string; contents: Electron.WebContents; onBeforeInput: BeforeInputListener; onEnterFullscreen: () => void; onLeaveFullscreen: () => void; onNavigate: (event: Electron.Event, url: string) => void; onNavigateInPage: (event: Electron.Event, url: string) => void; onDestroyed: () => void }>();
+type NavigationListener = (event: Electron.Event, url: string) => void;
+const guestBindings = new Map<number, { paneId: string; contents: Electron.WebContents; onBeforeInput: BeforeInputListener; onEnterFullscreen: () => void; onLeaveFullscreen: () => void; onWillNavigate: NavigationListener; onNavigate: NavigationListener; onNavigateInPage: NavigationListener; onDestroyed: () => void }>();
 const disabledAdblockRules = new Set<string>();
 const disabledAdblockPanes = new Set<string>();
 const challengeNavigation = new Map<string, ChallengeNavigationState>();
@@ -55,6 +57,7 @@ const installedSessionDiagnostics = new WeakSet<Electron.Session>();
 const headerDiagnosticSessions = new WeakSet<Electron.Session>();
 const knownPartitions = new Set<string>(["persist:shared"]);
 const partitionProxyKeys = new Map<string, string>();
+const authorizedLocalVideoUrls = new Set<string>();
 let globalProxySettings: GlobalProxySettings = defaultGlobalProxySettings();
 
 const defaultLayout: PersistedLayout = {
@@ -77,6 +80,46 @@ function isSafeUrl(value: unknown): value is string {
     return parsed.protocol === "http:" || parsed.protocol === "https:";
   } catch {
     return false;
+  }
+}
+
+function isFileUrl(value: string): boolean {
+  try {
+    return new URL(value).protocol === "file:";
+  } catch {
+    return false;
+  }
+}
+
+async function isAuthorizedLocalVideoUrl(value: unknown): Promise<boolean> {
+  if (typeof value !== "string" || !authorizedLocalVideoUrls.has(value) || !isFileUrl(value)) return false;
+  try {
+    const filePath = fileURLToPath(value);
+    const metadata = await fs.stat(filePath);
+    return isSupportedLocalVideoFile(path.basename(filePath), metadata.isFile());
+  } catch {
+    return false;
+  }
+}
+
+async function selectLocalVideo(): Promise<{ ok: true; url: string; fileName: string } | { ok: false; canceled: boolean; message?: string }> {
+  try {
+    const result = await dialog.showOpenDialog({
+      title: "选择本地视频",
+      properties: ["openFile"],
+      filters: [{ name: "视频文件", extensions: ["mp4", "m4v", "webm", "mov", "ogv"] }],
+    });
+    if (result.canceled || result.filePaths.length === 0) return { ok: false, canceled: true };
+    const filePath = result.filePaths[0];
+    const metadata = await fs.stat(filePath);
+    if (!isSupportedLocalVideoFile(path.basename(filePath), metadata.isFile())) {
+      return { ok: false, canceled: false, message: "请选择 MP4、M4V、WebM、MOV 或 OGV 视频文件" };
+    }
+    const url = pathToFileURL(filePath).toString();
+    authorizedLocalVideoUrls.add(url);
+    return { ok: true, url, fileName: path.basename(filePath) };
+  } catch {
+    return { ok: false, canceled: false, message: "无法读取所选本地视频，请确认文件仍存在且有访问权限" };
   }
 }
 
@@ -235,6 +278,10 @@ function recordFingerprintDiagnostic(paneId: string, data: unknown): void {
 }
 
 function handlePaneNavigation(paneId: string, contents: Electron.WebContents, url: string): void {
+  if (isFileUrl(url)) {
+    try { contents.send("challenge-navigation", { status: "none" }); } catch { }
+    return;
+  }
   if (isSafeUrl(url)) {
     try {
       paneHosts.set(paneId, new URL(url).hostname.toLowerCase());
@@ -271,6 +318,7 @@ function unbindGuest(webContentsId: number): void {
   binding.contents.removeListener("before-input-event", binding.onBeforeInput);
   binding.contents.removeListener("enter-html-full-screen", binding.onEnterFullscreen);
   binding.contents.removeListener("leave-html-full-screen", binding.onLeaveFullscreen);
+  binding.contents.removeListener("will-navigate", binding.onWillNavigate);
   binding.contents.removeListener("did-navigate", binding.onNavigate);
   binding.contents.removeListener("did-navigate-in-page", binding.onNavigateInPage);
   binding.contents.removeListener("destroyed", binding.onDestroyed);
@@ -358,16 +406,22 @@ function bindGuest(paneId: string, webContentsId: number): void {
     if (htmlFullscreenPaneId === paneId) htmlFullscreenPaneId = null;
     sendWindowMessage("window:html-fullscreen-change", paneId, false);
   };
+  const onWillNavigate: NavigationListener = (event, url) => {
+    if (isSafeUrl(url)) return;
+    if (isFileUrl(url) && authorizedLocalVideoUrls.has(url)) return;
+    event.preventDefault();
+  };
   const onNavigate = (_event: Electron.Event, url: string) => handlePaneNavigation(paneId, contents, url);
   const onNavigateInPage = (_event: Electron.Event, url: string) => handlePaneNavigation(paneId, contents, url);
   const onDestroyed = () => unbindGuest(webContentsId);
   contents.on("before-input-event", onBeforeInput);
   contents.on("enter-html-full-screen", onEnterFullscreen);
   contents.on("leave-html-full-screen", onLeaveFullscreen);
+  contents.on("will-navigate", onWillNavigate);
   contents.on("did-navigate", onNavigate);
   contents.on("did-navigate-in-page", onNavigateInPage);
   contents.on("destroyed", onDestroyed);
-  guestBindings.set(webContentsId, { paneId, contents, onBeforeInput, onEnterFullscreen, onLeaveFullscreen, onNavigate, onNavigateInPage, onDestroyed });
+  guestBindings.set(webContentsId, { paneId, contents, onBeforeInput, onEnterFullscreen, onLeaveFullscreen, onWillNavigate, onNavigate, onNavigateInPage, onDestroyed });
 }
 
 async function loadLayout(): Promise<PersistedLayout> {
@@ -566,6 +620,21 @@ function registerIpc(): void {
   });
   ipcMain.handle("layout:load", () => loadLayout());
   ipcMain.handle("layout:save", (_event, layout: unknown) => saveLayout(layout));
+  ipcMain.handle("pane:selectLocalVideo", () => selectLocalVideo());
+  ipcMain.handle("pane:loadLocalVideo", async (_event, paneId: unknown, value: unknown) => {
+    if (typeof paneId !== "string" || !await isAuthorizedLocalVideoUrl(value)) {
+      return { ok: false, message: "本地视频未获授权或已无法访问，请重新选择文件" };
+    }
+    const webContentsId = [...paneWebContents.entries()].find(([, registeredPaneId]) => registeredPaneId === paneId)?.[0];
+    const contents = webContentsId === undefined ? null : webContents.fromId(webContentsId);
+    if (!contents || contents.isDestroyed()) return { ok: false, message: "分屏播放器尚未准备好" };
+    try {
+      await contents.loadURL(value as string);
+      return { ok: true };
+    } catch {
+      return { ok: false, message: "本地视频无法加载，请确认文件未被删除且格式受支持" };
+    }
+  });
   ipcMain.handle("pane:openInChrome", (_event, value: unknown) => openInChrome(value));
   ipcMain.handle("pane:openAuthWindow", (_event, value: unknown, partition: unknown) => openAuthenticationWindow(value, partition));
   ipcMain.handle("window:exitWebpageFullscreen", (_event, paneId: unknown) => exitWebpageFullscreen(typeof paneId === "string" ? paneId : undefined));
@@ -685,11 +754,15 @@ function registerIpc(): void {
     panePartitions.set(paneId, partition);
     paneProxySettings.set(paneId, paneProxy);
     bindGuest(paneId, webContentsId);
-    if (typeof pageUrl === "string" && isSafeUrl(pageUrl)) {
+    if (typeof pageUrl === "string" && await isAuthorizedLocalVideoUrl(pageUrl)) {
+      paneHosts.delete(paneId);
+    } else if (typeof pageUrl === "string" && isSafeUrl(pageUrl)) {
       try {
         paneHosts.set(paneId, new URL(pageUrl).hostname.toLowerCase());
       } catch {
       }
+    } else {
+      paneHosts.delete(paneId);
     }
     knownPartitions.add(partition);
     configureSession(session.fromPartition(partition));

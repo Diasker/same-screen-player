@@ -12,6 +12,8 @@ interface DesktopApi {
   onPaneBlocked: (callback: (paneId: string, statusCode: number, challenge: boolean) => void) => void;
   loadLayout: () => Promise<unknown>;
   saveLayout: (layout: unknown) => Promise<boolean>;
+  selectLocalVideo: () => Promise<unknown>;
+  loadLocalVideo: (paneId: string, url: string) => Promise<unknown>;
   clearSession: () => Promise<boolean>;
   registerPane: (paneId: string, webContentsId: number, partition: string, pageUrl?: string, proxy?: unknown) => Promise<boolean>;
   getGlobalProxy: () => Promise<unknown>;

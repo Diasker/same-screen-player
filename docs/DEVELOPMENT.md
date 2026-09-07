@@ -30,7 +30,7 @@ The application window enables `contextIsolation`, `sandbox`, and disabled Node 
 
 | 路径 / Path | 作用 / Responsibility |
 | --- | --- |
-| `electron/main.ts` | 主进程入口：创建窗口、注册 IPC、管理 webview、Session、代理、广告拦截、导航和全屏。 / Main-process entry: windows, IPC, webviews, Sessions, proxies, ad blocking, navigation, and fullscreen. |
+| `electron/main.ts` | 主进程入口：创建窗口、注册 IPC、管理 webview、Session、代理、广告拦截、导航、受控本地视频选择和全屏。 / Main-process entry: windows, IPC, webviews, Sessions, proxies, ad blocking, navigation, controlled local-video selection, and fullscreen. |
 | `electron/preload.ts` | 宿主窗口的安全 `contextBridge` API。 / Secure `contextBridge` API for the host window. |
 | `electron/guest-preload.ts` | webview 访客脚本：播放器识别、播放命令、状态上报、专注模式和 Cloudflare 挑战检测。 / Guest script for player detection, commands, state reporting, focus mode, and Cloudflare challenge detection. |
 | `electron/fingerprint.ts` | Electron Session 的 Chrome 风格 User-Agent、Client Hints 和页面指纹注入。 / Chrome-style User-Agent, Client Hints, and page fingerprint injection for Electron Sessions. |
@@ -58,6 +58,8 @@ The application window enables `contextIsolation`, `sandbox`, and disabled Node 
 - The main process applies the proxy to `persist:shared` before creating the window, then installs fingerprinting, diagnostics, and ad blocking.
 - webview `dom-ready` 后通过 `pane:register` 注册 pane、Session 分区和当前代理策略，成功后才加载网址。
 - After webview `dom-ready`, `pane:register` registers the pane, Session partition, and effective proxy policy before loading its URL.
+- 本地视频由主进程文件选择器返回编码后的 `file:` 地址；仅本次运行中由选择器授权且仍是受支持普通文件的地址可被加载到 webview。
+- The main-process picker returns encoded `file:` URLs; only supported regular files authorized during the current run may load in a webview.
 
 ### 代理优先级 / Proxy precedence
 
@@ -76,6 +78,12 @@ Electron proxies are Session-scoped. A shared Session cannot carry different pro
 - 应用操作模式将 webview 的鼠标事件交给布局层，显示应用播放控制、拖拽交换和右键菜单。
 - App mode routes pointer handling to the layout layer for app controls, pane dragging, and the context menu.
 
+### 本地视频 / Local video
+
+本地视频使用系统选择器选择单个 `MP4`、`M4V`、`WebM`、`MOV` 或 `OGV` 文件。应用控制和网页操作模式均可替换当前分屏；本地来源复用播放器控制，但隐藏代理、会话、广告拦截、登录和 Chrome 兜底等网络专用功能。文件被删除、没有访问权限或 Chromium 无法解码时，仅当前分屏显示错误。
+
+Local video uses the system picker for one `MP4`, `M4V`, `WebM`, `MOV`, or `OGV` file. Both App and Web modes can replace the current pane. Local sources reuse player controls while hiding network-only features such as proxy, session, ad blocking, sign-in, and Chrome fallback. Deleted, inaccessible, or unsupported media reports an error only in its own pane.
+
 ### Cloudflare 与 Chrome 边界 / Cloudflare and Chrome boundary
 
 Cloudflare 挑战识别、Turnstile 资源放行、循环检测和 Electron 指纹注入分别位于 `cloudflare.ts`、`main.ts`、`guest-preload.ts` 和 `fingerprint.ts`。Chrome DevTools Protocol 代码只服务于 Google 登录；通用“用 Chrome 打开”只处理播放受限页面，不参与 Cloudflare Cookie 导入。
@@ -86,6 +94,8 @@ Cloudflare detection, Turnstile resource allow rules, loop detection, and Electr
 
 - `layout.json`：只保存布局树和版本号，不保存网页地址。
 - `layout.json`: stores only the versioned layout tree, not page URLs.
+- 本地视频路径只保存在运行内存中，不会写入 `layout.json` 或其他持久化设置。
+- Local video paths exist only in runtime memory and are never written to `layout.json` or other persistent settings.
 - `proxy-settings.json`：保存全局代理模式、地址、端口、例外地址和本地地址选项。
 - `proxy-settings.json`: stores the global proxy mode, host, port, bypass rules, and local-address option.
 - `localStorage`：保存应用字号选择。

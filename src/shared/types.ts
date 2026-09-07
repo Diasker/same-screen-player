@@ -19,6 +19,8 @@ export type SessionMode = "shared" | "isolated";
 
 export type InteractionMode = "web" | "app";
 
+export type PaneMediaSource = "network" | "local";
+
 export type ProxyMode = "system" | "direct" | "custom";
 
 export type PaneProxyMode = "inherit" | "direct" | "custom";
@@ -75,6 +77,8 @@ export type PlaybackSnapshot = {
 export type PaneRuntime = {
   paneId: string;
   url: string;
+  mediaSource: PaneMediaSource;
+  localFileName?: string;
   sessionMode: SessionMode;
   muted: boolean;
   adblockEnabled: boolean;
@@ -95,6 +99,28 @@ export type PersistedLayout = {
 };
 
 export const MAX_PANES = 6;
+
+export const LOCAL_VIDEO_FILE_EXTENSIONS = ["mp4", "m4v", "webm", "mov", "ogv"] as const;
+
+export function isSupportedLocalVideoFile(fileName: string, isFile = true): boolean {
+  if (!isFile || !fileName.trim()) return false;
+  const extension = fileName.trim().split(".").pop()?.toLowerCase();
+  return extension !== undefined && (LOCAL_VIDEO_FILE_EXTENSIONS as readonly string[]).includes(extension);
+}
+
+export function normalizeNetworkUrl(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 4096) return null;
+  if (/^(?:file:|[a-zA-Z]:[\\/]|\\\\|\/)/i.test(trimmed)) return null;
+  const candidate = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  try {
+    const parsed = new URL(candidate);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
 
 export function defaultHttpProxyEndpoint(): HttpProxyEndpoint {
   return { host: "", port: 8080, bypassList: "", bypassLocal: true };
