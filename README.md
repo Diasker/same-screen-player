@@ -28,8 +28,8 @@ Playback uses embedded Electron `<webview>` elements. The real Chrome browser is
 - Custom HTTP proxy settings support host, port, bypass rules, and local-address bypass; SOCKS and proxy authentication are not supported.
 - 默认使用共享登录会话；分屏使用独立代理时会自动切换独立 Session，并提示 Cookie 隔离。
 - Panes share a login session by default. Selecting a pane-specific proxy automatically switches that pane to an isolated Session and warns about Cookie isolation.
-- Cloudflare 挑战资源在 Electron 分屏中保留并放行，指纹伪装帮助多数站点直接完成验证；挑战循环时可以手动重新加载验证页。
-- Cloudflare challenge resources remain available inside Electron panes, while browser fingerprint emulation helps most sites complete verification; looping challenges can be manually reloaded.
+- Cloudflare 挑战资源在 Electron 分屏中保留并放行，指纹伪装帮助多数站点直接完成验证；检测到循环时应用会停止自动刷新。
+- Cloudflare challenge resources remain available inside Electron panes, while browser fingerprint emulation helps most sites complete verification; automatic refresh stops when a loop is detected.
 - 可通过系统文件选择器播放单个本地 MP4、M4V、WebM、MOV 或 OGV 视频，并使用现有播放、进度、音量和倍速控制。
 - Use the system file picker to play one local MP4, M4V, WebM, MOV, or OGV video with the existing play, seek, volume, and speed controls.
 
@@ -105,7 +105,11 @@ npm run dist
 
 `npm run dev` 会启动 Vite 和 Electron。改动主进程或访客预加载脚本后，请重新运行 `npm run build` 并彻底重启开发进程；仅刷新页面或依赖 HMR 不会重新加载这些脚本。
 
+开发模式会显示网页操作模式的分屏调试提示。发布版默认隐藏；如需排查问题，请启动应用时附加 `--debug-overlays` 参数。
+
 `npm run dev` starts Vite and Electron. After changing the main process or guest preload, run `npm run build` and fully restart the development process; a page refresh or HMR alone does not reload those scripts.
+
+Development mode shows pane debug notices in Web mode. Production builds hide them by default; add `--debug-overlays` when launching the app to inspect them.
 
 更多技术结构、目录说明和故障排查请参阅 [开发者文档 / Developer Guide](docs/DEVELOPMENT.md)。
 

@@ -2,6 +2,7 @@
 
 interface DesktopApi {
   guestPreloadUrl: string;
+  getRuntimeFlags: () => Promise<{ debugOverlays: boolean }>;
   setFullscreen: (enabled: boolean) => Promise<boolean>;
   setInteractionMode: (mode: "web" | "app") => Promise<boolean>;
   onFullscreenChange: (callback: (fullscreen: boolean) => void) => void;
@@ -25,7 +26,6 @@ interface DesktopApi {
   exitWebpageFullscreen: (paneId?: string) => Promise<boolean>;
   setAdblock: (paneId: string, host: string, enabled: boolean) => Promise<boolean>;
   setChallengeMode: (paneId: string, enabled: boolean) => Promise<boolean>;
-  reloadChallenge: (paneId: string) => Promise<boolean>;
   reportChallengeState: (paneId: string, state: unknown) => Promise<boolean>;
   inspectFingerprint: (paneId: string) => Promise<unknown>;
   openChromeLogin: (url: string) => Promise<unknown>;

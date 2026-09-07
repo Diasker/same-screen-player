@@ -160,8 +160,10 @@ npm run dist
 - Page clicks do nothing: switch to Web mode; App mode intentionally blocks webview pointer events.
 - 代理修改后页面仍使用旧连接：确认主进程已调用 `closeAllConnections()`，然后重新启动应用检查 Session 是否重建。
 - A page still uses an old proxy connection: ensure `closeAllConnections()` runs in the main process, then restart the app to verify the Session is recreated.
-- Cloudflare 挑战循环：查看 `cloudflare-diagnostics.log`，确认挑战资源没有被广告拦截器阻断，并使用分屏里的“重新加载验证页”。
-- Cloudflare loops: inspect `cloudflare-diagnostics.log`, verify challenge resources are not blocked, and use “重新加载验证页 / Reload challenge” in the pane.
+- Cloudflare 挑战循环：查看 `cloudflare-diagnostics.log`，确认挑战资源没有被广告拦截器阻断；应用会停止自动刷新，必要时可使用普通“刷新”重新加载分屏。
+- Cloudflare loops: inspect `cloudflare-diagnostics.log`, verify challenge resources are not blocked; automatic refresh stops, and the normal Reload control can reload the pane if needed.
+- 网页操作模式的分屏顶部诊断提示：开发模式自动显示；发布版默认隐藏。启动应用时附加精确参数 `--debug-overlays` 可临时显示。
+- Pane-top diagnostic notices in Web mode: shown automatically in development and hidden by default in production. Launch with the exact `--debug-overlays` argument to show them temporarily.
 - 指纹问题：使用应用诊断入口检查 `fingerprint` 日志；不要把真实 Chrome 的 Cookie 或 Profile 导入 Electron Session。
 - Fingerprint issues: inspect the fingerprint diagnostics; do not import real Chrome Cookies or profiles into an Electron Session.
 - 修改主进程后没有变化：重新执行 `npm run build`，完全退出旧 Electron 进程，再运行 `npm run dev`。

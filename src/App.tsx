@@ -30,6 +30,7 @@ import {
   type Preset,
 } from "./shared/types";
 import { resolveEscapeAction, toggleInteractionMode } from "./shared/interaction";
+import { shouldShowPaneNotice } from "./shared/debug-overlays";
 
 type WebviewElement = HTMLElement & {
   loadURL: (url: string) => Promise<void>;
@@ -198,6 +199,7 @@ type PaneViewProps = {
   onOpenChrome: () => void;
   onProxyChange: (settings: PaneProxySettings) => void;
   interactionMode: InteractionMode;
+  debugOverlays: boolean;
 };
 
 function isAuthenticationUrl(value: string): boolean {
@@ -666,10 +668,6 @@ function PaneView(props: PaneViewProps): ReactElement {
     props.onUpdate({ userPauseIntent: false, playerStatus: "loading", cloudflareStatus: "none", error: undefined });
     webviewRef.current?.reload();
   };
-  const reloadChallenge = async () => {
-    const reloaded = await window.desktop.reloadChallenge(runtime.paneId);
-    if (reloaded) props.onUpdate({ cloudflareStatus: "detected", playerStatus: "loading", error: undefined, userPauseIntent: false });
-  };
   const toggleSessionMode = () => {
     if (isLocalVideo) return;
     if (runtime.sessionMode === "isolated" && runtime.proxy.mode !== "inherit") {
@@ -710,6 +708,8 @@ function PaneView(props: PaneViewProps): ReactElement {
   const rateOptions = RATE_OPTIONS.includes(currentRate) ? RATE_OPTIONS : [...RATE_OPTIONS, currentRate].sort((a, b) => a - b);
   const decoderIssue = runtime.playback.hasVideo && runtime.playback.readyState >= 2 && (runtime.playback.videoWidth === 0 || runtime.playback.videoHeight === 0);
   const renderIssue = runtime.focusModeEnabled && runtime.playerStatus === "ready" && runtime.playback.hasVideo && runtime.playback.videoWidth > 0 && runtime.playback.videoHeight > 0 && (runtime.playback.playerWidth <= 2 || runtime.playback.playerHeight <= 2);
+  const hasPaneNotice = Boolean(runtime.error || runtime.playerStatus === "unrecognized" || runtime.playerStatus === "challenge" || runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped");
+  const showPaneNotice = shouldShowPaneNotice({ debugOverlays: props.debugOverlays, interactionMode: props.interactionMode, hasContent: Boolean(runtime.url), hasNotice: hasPaneNotice });
 
   return (
     <div className={`video-pane ${props.active ? "active" : ""} ${props.interactionMode === "app" ? "app-input-mode" : "web-input-mode"}`} onPointerDown={props.onActive} onPointerMove={handleMouseMove} onMouseLeave={() => runtime.url && hideControls()}>
@@ -768,7 +768,6 @@ function PaneView(props: PaneViewProps): ReactElement {
               <option value="custom">分屏自定义 HTTP</option>
             </select>
             }
-            {!isLocalVideo && (runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped") && <button className="icon-button warning" onClick={() => void reloadChallenge()}>重新加载验证页</button>}
             {!isLocalVideo && runtime.playerStatus === "blocked" && <button className="icon-button warning" onClick={props.onOpenChrome}>用 Chrome 打开</button>}
             <button className="icon-button" onClick={hideControls}>收起</button>
             <button className="icon-button danger" onClick={props.onRemove}>关闭</button>
@@ -777,7 +776,7 @@ function PaneView(props: PaneViewProps): ReactElement {
           {runtime.error && <div className="pane-error">{runtime.error}</div>}
           {runtime.playerStatus === "unrecognized" && !runtime.error && <div className="pane-error">无法识别播放器，已保留网页兼容画面。</div>}
           {runtime.cloudflareStatus === "detected" && <div className="pane-error">检测到 Cloudflare 验证，已放行验证资源，请在当前页面完成验证。</div>}
-          {runtime.cloudflareStatus === "looped" && <div className="pane-error">验证仍在循环，应用已停止自动刷新；可手动重新加载验证页。</div>}
+          {runtime.cloudflareStatus === "looped" && <div className="pane-error">验证仍在循环，应用已停止自动刷新。</div>}
           {decoderIssue && <div className="pane-error">视频尚未解码，当前视频尺寸无效；可切换“网页原始模式”重试。</div>}
           {renderIssue && <div className="pane-error">视频层渲染异常；可切换“网页原始模式”恢复站点原生布局。</div>}
         </div>
@@ -792,10 +791,9 @@ function PaneView(props: PaneViewProps): ReactElement {
           <div className="proxy-form-actions"><button className="icon-button" onClick={() => setProxyEditorOpen(false)}>取消</button><button className="icon-button primary" onClick={savePaneProxy}>保存</button></div>
         </div>
       )}
-      {runtime.url && props.interactionMode === "web" && (runtime.error || runtime.playerStatus === "unrecognized" || runtime.playerStatus === "challenge" || runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped") && (
+      {showPaneNotice && (
         <div className="pane-notice">
           <span>{runtime.cloudflareStatus === "detected" ? "检测到 Cloudflare 验证，已放行验证资源，请在当前页面完成验证。" : runtime.cloudflareStatus === "looped" ? "验证仍在循环，应用已停止自动刷新。" : runtime.error || (runtime.playerStatus === "challenge" ? "请在当前分屏完成 Cloudflare 验证" : "无法识别播放器，已保留网页兼容画面")}</span>
-          {!isLocalVideo && (runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped") && <button className="icon-button warning" onClick={() => void reloadChallenge()}>重新加载验证页</button>}
           {!isLocalVideo && runtime.playerStatus === "blocked" && <button className="icon-button warning" onClick={props.onOpenChrome}>用 Chrome 打开</button>}
         </div>
       )}
@@ -841,6 +839,7 @@ type LayoutSurfaceProps = {
   onRemove: (paneId: string) => void;
   onOpenChrome: (paneId: string) => void;
   interactionMode: InteractionMode;
+  debugOverlays: boolean;
 };
 
 function LayoutSurface(props: LayoutSurfaceProps): ReactElement {
@@ -936,7 +935,7 @@ function LayoutSurface(props: LayoutSurfaceProps): ReactElement {
         const runtime = props.runtimes[rect.paneId] ?? makeRuntime(rect.paneId);
         const isDragged = dragState?.paneId === rect.paneId && dragState.dragging;
         const isDropTarget = dragState?.targetPaneId === rect.paneId;
-        return <div key={rect.paneId} ref={(element) => { if (element) paneRefs.current.set(rect.paneId, element); else paneRefs.current.delete(rect.paneId); }} className={`layout-pane ${isDragged ? "is-dragging" : ""} ${isDropTarget ? "is-drop-target" : ""}`} style={{ left: `${rect.left * 100}%`, top: `${rect.top * 100}%`, width: `${rect.width * 100}%`, height: `${rect.height * 100}%`, transform: isDragged ? `translate(${dragState.offsetX}px, ${dragState.offsetY}px)` : undefined }} onPointerDown={(event) => startDrag(event, rect.paneId)} onPointerMove={updateDrag} onPointerUp={finishDrag} onPointerCancel={finishDrag} onContextMenu={(event) => showContextMenu(event, rect.paneId)}><PaneView runtime={runtime} active={props.activePaneId === rect.paneId} interactionMode={props.interactionMode} guestPreloadUrl={props.guestPreloadUrl} onActive={() => props.onActive(rect.paneId)} onNavigate={(value) => props.onNavigate(rect.paneId, value)} onUpdate={(patch) => props.onUpdatePane(rect.paneId, patch)} onProxyChange={(settings) => props.onProxyChange(rect.paneId, settings)} onSplit={(orientation) => props.onSplit(rect.paneId, orientation)} onRemove={() => props.onRemove(rect.paneId)} onOpenChrome={() => props.onOpenChrome(rect.paneId)} /></div>;
+        return <div key={rect.paneId} ref={(element) => { if (element) paneRefs.current.set(rect.paneId, element); else paneRefs.current.delete(rect.paneId); }} className={`layout-pane ${isDragged ? "is-dragging" : ""} ${isDropTarget ? "is-drop-target" : ""}`} style={{ left: `${rect.left * 100}%`, top: `${rect.top * 100}%`, width: `${rect.width * 100}%`, height: `${rect.height * 100}%`, transform: isDragged ? `translate(${dragState.offsetX}px, ${dragState.offsetY}px)` : undefined }} onPointerDown={(event) => startDrag(event, rect.paneId)} onPointerMove={updateDrag} onPointerUp={finishDrag} onPointerCancel={finishDrag} onContextMenu={(event) => showContextMenu(event, rect.paneId)}><PaneView runtime={runtime} active={props.activePaneId === rect.paneId} interactionMode={props.interactionMode} debugOverlays={props.debugOverlays} guestPreloadUrl={props.guestPreloadUrl} onActive={() => props.onActive(rect.paneId)} onNavigate={(value) => props.onNavigate(rect.paneId, value)} onUpdate={(patch) => props.onUpdatePane(rect.paneId, patch)} onProxyChange={(settings) => props.onProxyChange(rect.paneId, settings)} onSplit={(orientation) => props.onSplit(rect.paneId, orientation)} onRemove={() => props.onRemove(rect.paneId)} onOpenChrome={() => props.onOpenChrome(rect.paneId)} /></div>;
       })}
       {geometry.dividers.map((divider) => <LayoutDivider key={divider.path.join(".")} divider={divider} onResize={props.onResize} />)}
       {contextMenu && <div className="pane-context-menu" style={{ left: contextMenu.left, top: contextMenu.top }} role="menu"><button type="button" role="menuitem" className="pane-context-action" disabled={geometry.panes.length <= 1} onClick={() => { setContextMenu(null); props.onRemove(contextMenu.paneId); }}>关闭当前分屏</button></div>}
@@ -984,7 +983,12 @@ export default function App(): ReactElement {
   const [globalProxyDraft, setGlobalProxyDraft] = useState<GlobalProxySettings>(() => defaultGlobalProxySettings());
   const [globalProxyOpen, setGlobalProxyOpen] = useState(false);
   const [globalProxyError, setGlobalProxyError] = useState<string | null>(null);
+  const [debugOverlays, setDebugOverlays] = useState(import.meta.env.DEV);
   const paneIds = useMemo(() => getPaneIds(layout), [layout]);
+
+  useEffect(() => {
+    void window.desktop.getRuntimeFlags().then((flags) => setDebugOverlays(import.meta.env.DEV || flags.debugOverlays)).catch(() => undefined);
+  }, []);
 
   useEffect(() => {
     window.desktop.onFullscreenChange(setFullscreen);
@@ -1231,7 +1235,7 @@ export default function App(): ReactElement {
     <div className={`app-shell ${fullscreen ? "is-fullscreen" : ""} ${htmlFullscreen ? "is-html-fullscreen" : ""} ${interactionMode === "app" ? "is-app-input-mode" : "is-web-input-mode"}`} style={{ "--app-font-scale": fontScale } as CSSProperties}>
        <header className="app-header"><div className="brand"><div className="brand-mark">▦</div><div><div className="brand-title">同屏播放</div><div className="brand-subtitle">沉浸式多视频工作台</div></div></div><div className="header-actions"><span className={`interaction-mode ${interactionMode}`}>{interactionMode === "web" ? "网页操作" : "应用操作"}</span><button className="header-button" onClick={toggleInputMode}>{interactionMode === "web" ? "切到应用层" : "切回网页层"} · F8</button><button className={`header-button proxy-button ${globalProxy.mode === "custom" ? "selected" : ""}`} onClick={openGlobalProxyEditor}>代理：{proxyModeLabel(globalProxy.mode)}</button><label className="font-scale-control"><span>字号</span><select aria-label="应用字号" value={fontScale} onChange={(event) => setFontScale(Number(event.target.value))}>{FONT_SCALE_OPTIONS.map((value) => <option key={value} value={value}>{Math.round(value * 100)}%</option>)}</select></label><span className="pane-count">{paneIds.length}/{MAX_PANES} 格</span><button className="header-button" onClick={() => void toggleFullscreen()}>{fullscreen ? "退出全屏" : "全屏"}</button><button className="header-button" onClick={() => void save()}>保存布局</button><button className="header-button subtle" onClick={() => void clearSession()}>清除登录</button></div>{globalProxyOpen && <div className="proxy-popover global-proxy-popover" onPointerDown={(event) => event.stopPropagation()} role="dialog" aria-label="全局代理设置"><div className="proxy-popover-title">全局代理设置</div><div className="proxy-form-hint">仅影响 Electron 内嵌分屏，不改变外部 Chrome 的网络设置。</div><label className="proxy-mode-field">代理模式<select value={globalProxyDraft.mode} onChange={(event) => setGlobalProxyDraft((current) => ({ ...current, mode: event.target.value as GlobalProxySettings["mode"] }))}><option value="system">系统代理</option><option value="direct">直连（不使用代理）</option><option value="custom">自定义 HTTP</option></select></label>{globalProxyDraft.mode === "custom" && <><label className="proxy-checkbox"><input type="checkbox" checked={globalProxyDraft.mode === "custom"} onChange={(event) => setGlobalProxyDraft((current) => ({ ...current, mode: event.target.checked ? "custom" : "direct" }))} />使用代理服务器</label><ProxyEndpointFields value={globalProxyDraft.custom} onChange={(custom) => setGlobalProxyDraft((current) => ({ ...current, custom }))} /></>}{globalProxyError && <div className="proxy-form-error">{globalProxyError}</div>}<div className="proxy-form-actions"><button className="icon-button" onClick={() => { setGlobalProxyOpen(false); setGlobalProxyError(null); }}>取消</button><button className="icon-button primary" onClick={() => void saveGlobalProxy()}>保存</button></div></div>}</header>
        <div className="toolbar"><span className="toolbar-label">布局</span><div className="preset-group">{(["single", "split-2", "split-3", "grid-2x2", "grid-3x2"] as Preset[]).map((preset) => <button key={preset} className="preset-button" onClick={() => applyPreset(preset)}>{presetLabel(preset)}</button>)}</div><div className="toolbar-hint">{interactionMode === "web" ? "网页播放器直接接收鼠标和键盘 · F8 切换应用层" : "应用层接管活动分屏 · 鼠标移到底部显示控制"}</div></div>
-       <main className="workspace">{guestPreloadUrl ? <LayoutSurface layout={layout} runtimes={runtimes} activePaneId={activePaneId} interactionMode={interactionMode} guestPreloadUrl={guestPreloadUrl} onActive={setActivePaneId} onNavigate={navigate} onUpdatePane={updatePane} onProxyChange={updatePaneProxy} onResize={resizeDivider} onSwap={swapPanes} onSplit={split} onRemove={closePane} onOpenChrome={(paneId) => void openChrome(paneId)} /> : <div className="loading-state">正在准备网页播放内核…</div>}</main>
+       <main className="workspace">{guestPreloadUrl ? <LayoutSurface layout={layout} runtimes={runtimes} activePaneId={activePaneId} interactionMode={interactionMode} debugOverlays={debugOverlays} guestPreloadUrl={guestPreloadUrl} onActive={setActivePaneId} onNavigate={navigate} onUpdatePane={updatePane} onProxyChange={updatePaneProxy} onResize={resizeDivider} onSwap={swapPanes} onSplit={split} onRemove={closePane} onOpenChrome={(paneId) => void openChrome(paneId)} /> : <div className="loading-state">正在准备网页播放内核…</div>}</main>
        <footer className="status-bar"><span className="status-dot" /><span>{status}</span><span className="status-spacer" /><span>全局代理：{proxyModeLabel(globalProxy.mode)} · 共享会话 · 安全拦截</span></footer>
       {(fullscreen || htmlFullscreen) && (
         <div className="fullscreen-top-zone">

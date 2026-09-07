@@ -32,8 +32,12 @@ import {
 import { ChromeSessionManager } from "./cdp";
 import { chromeUserAgent, installFingerprintForSession, mainWorldFingerprintScript } from "./fingerprint";
 import { helperPath, WindowsWindowHelper } from "./windows-helper";
+import { debugOverlaysEnabled } from "../src/shared/debug-overlays";
 
 app.userAgentFallback = chromeUserAgent();
+const runtimeFlags = {
+  debugOverlays: debugOverlaysEnabled(process.argv, Boolean(process.env.VITE_DEV_SERVER_URL)),
+};
 
 let mainWindow: BrowserWindow | null = null;
 let interactionMode: InteractionMode = "web";
@@ -527,6 +531,7 @@ function collectPaneIds(node: LayoutNode): string[] {
 }
 
 function registerIpc(): void {
+  ipcMain.handle("app:getRuntimeFlags", () => runtimeFlags);
   ipcMain.on("get-guest-preload-url", (event) => {
     event.returnValue = pathToFileURL(path.join(__dirname, "guest-preload.js")).toString();
   });
@@ -711,17 +716,6 @@ function registerIpc(): void {
     if (typeof paneId !== "string") return false;
     if (enabled) challengeModePanes.add(paneId);
     else challengeModePanes.delete(paneId);
-    return true;
-  });
-  ipcMain.handle("pane:reloadChallenge", (_event, paneId: unknown) => {
-    if (typeof paneId !== "string") return false;
-    const webContentsId = [...paneWebContents.entries()].find(([, registeredPaneId]) => registeredPaneId === paneId)?.[0];
-    if (webContentsId === undefined) return false;
-    const contents = webContents.fromId(webContentsId);
-    if (!contents || contents.isDestroyed()) return false;
-    challengeNavigation.set(paneId, emptyChallengeNavigation());
-    recordCloudflareDiagnostic(paneId, contents.getURL(), "manual-reload", 0);
-    contents.reload();
     return true;
   });
   ipcMain.handle("pane:reportChallengeState", (_event, paneId: unknown, state: unknown) => {

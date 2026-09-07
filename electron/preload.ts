@@ -11,6 +11,7 @@ let proxyStatusListener: ((event: Electron.IpcRendererEvent, status: unknown) =>
 
 contextBridge.exposeInMainWorld("desktop", {
   guestPreloadUrl: ipcRenderer.sendSync("get-guest-preload-url") as string,
+  getRuntimeFlags: (): Promise<{ debugOverlays: boolean }> => ipcRenderer.invoke("app:getRuntimeFlags"),
   setFullscreen: (enabled: boolean): Promise<boolean> => ipcRenderer.invoke("window:setFullscreen", enabled),
   setInteractionMode: (mode: "web" | "app"): Promise<boolean> => ipcRenderer.invoke("window:setInteractionMode", mode),
   onFullscreenChange: (callback: (fullscreen: boolean) => void): void => {
@@ -69,7 +70,6 @@ contextBridge.exposeInMainWorld("desktop", {
     ipcRenderer.invoke("pane:setAdblock", paneId, host, enabled),
   setChallengeMode: (paneId: string, enabled: boolean): Promise<boolean> =>
     ipcRenderer.invoke("pane:setChallengeMode", paneId, enabled),
-  reloadChallenge: (paneId: string): Promise<boolean> => ipcRenderer.invoke("pane:reloadChallenge", paneId),
   reportChallengeState: (paneId: string, state: unknown): Promise<boolean> =>
     ipcRenderer.invoke("pane:reportChallengeState", paneId, state),
   inspectFingerprint: (paneId: string): Promise<unknown> => ipcRenderer.invoke("pane:inspectFingerprint", paneId),
