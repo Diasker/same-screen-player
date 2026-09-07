@@ -666,7 +666,30 @@ function registerIpc(): void {
     if (webContentsId === undefined) return null;
     const contents = webContents.fromId(webContentsId);
     if (!contents || contents.isDestroyed()) return null;
-    const script = `JSON.stringify({ applied: window.__sameScreenFingerprintApplied === true, ua: navigator.userAgent, brands: (navigator.userAgentData && navigator.userAgentData.brands) ? Array.from(navigator.userAgentData.brands) : null, plugins: (navigator.plugins && navigator.plugins.length) || 0, mimeTypes: (navigator.mimeTypes && navigator.mimeTypes.length) || 0, webdriver: navigator.webdriver, chrome: typeof window.chrome })`;
+    const script = `(async () => {
+      const gl = document.createElement("canvas").getContext("webgl") || document.createElement("canvas").getContext("experimental-webgl");
+      const debug = gl && gl.getExtension ? gl.getExtension("WEBGL_debug_renderer_info") : null;
+      const highEntropy = navigator.userAgentData && navigator.userAgentData.getHighEntropyValues
+        ? await navigator.userAgentData.getHighEntropyValues(["architecture", "bitness", "platformVersion", "uaFullVersion", "wow64"])
+        : null;
+      return JSON.stringify({
+        applied: window.__sameScreenFingerprintApplied === true,
+        ua: navigator.userAgent,
+        brands: (navigator.userAgentData && navigator.userAgentData.brands) ? Array.from(navigator.userAgentData.brands) : null,
+        highEntropy,
+        platform: navigator.platform,
+        languages: navigator.languages ? Array.from(navigator.languages) : null,
+        hardwareConcurrency: navigator.hardwareConcurrency,
+        deviceMemory: navigator.deviceMemory,
+        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        screen: { width: screen.width, height: screen.height, availWidth: screen.availWidth, availHeight: screen.availHeight, colorDepth: screen.colorDepth },
+        webgl: debug && gl ? { vendor: gl.getParameter(debug.UNMASKED_VENDOR_WEBGL), renderer: gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) } : null,
+        plugins: (navigator.plugins && navigator.plugins.length) || 0,
+        mimeTypes: (navigator.mimeTypes && navigator.mimeTypes.length) || 0,
+        webdriver: navigator.webdriver,
+        chrome: typeof window.chrome,
+      });
+    })()`;
     try {
       const raw = (await contents.executeJavaScript(script, true)) as string;
       const parsed = JSON.parse(raw) as Record<string, unknown>;

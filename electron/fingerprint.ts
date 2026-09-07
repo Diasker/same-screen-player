@@ -2,8 +2,51 @@ import type { Session } from "electron";
 
 const FALLBACK_CHROME_VERSION = "142.0.0.0";
 
+type FingerprintProfile = {
+  version: string;
+  userAgent: string;
+  secPlatform: string;
+  navPlatform: string;
+  platformVersion: string;
+  architecture: string;
+  bitness: string;
+  wow64: boolean;
+  timeZone: string;
+  languages: string[];
+  webglVendor: string;
+  webglRenderer: string;
+};
+
+function runtimeProcess(): (NodeJS.Process & { getSystemVersion?: () => string }) | null {
+  return typeof process === "object" && process !== null ? process as NodeJS.Process & { getSystemVersion?: () => string } : null;
+}
+
+function runtimeArch(): string {
+  return runtimeProcess()?.arch ?? "unknown";
+}
+
+function isArmRuntime(): boolean {
+  const arch = runtimeArch();
+  return arch === "arm64" || arch === "arm";
+}
+
+function architectureBitness(): string {
+  const arch = runtimeArch();
+  return /64$/.test(arch) || arch === "x64" || arch === "arm64" ? "64" : "32";
+}
+
+function architectureToken(): string {
+  return isArmRuntime() ? "arm" : "x86";
+}
+
+function wow64Runtime(): boolean {
+  const current = runtimeProcess();
+  if (!current || current.platform !== "win32" || architectureBitness() !== "32") return false;
+  return typeof current.env?.PROCESSOR_ARCHITEW6432 === "string" && current.env.PROCESSOR_ARCHITEW6432.length > 0;
+}
+
 export function chromeFullVersion(): string {
-  const version = process.versions?.chrome;
+  const version = runtimeProcess()?.versions?.chrome;
   return typeof version === "string" && version.length > 0 ? version : FALLBACK_CHROME_VERSION;
 }
 
@@ -12,33 +55,105 @@ export function chromeMajorVersion(): string {
 }
 
 export function platformToken(): string {
-  if (process.platform === "win32") return "Windows NT 10.0; Win64; x64";
-  if (process.platform === "darwin") return "Macintosh; Intel Mac OS X 10_15_7";
-  return "X11; Linux x86_64";
+  const current = runtimeProcess();
+  if (current?.platform === "win32") {
+    if (architectureBitness() === "32") return "Windows NT 10.0; Win32";
+    return isArmRuntime() ? "Windows NT 10.0; Win64; ARM64" : "Windows NT 10.0; Win64; x64";
+  }
+  if (current?.platform === "darwin") return "Macintosh; Intel Mac OS X 10_15_7";
+  return isArmRuntime() ? "X11; Linux aarch64" : architectureBitness() === "32" ? "X11; Linux i686" : "X11; Linux x86_64";
 }
 
 export function secChUaPlatform(): string {
-  if (process.platform === "win32") return "Windows";
-  if (process.platform === "darwin") return "macOS";
+  const current = runtimeProcess();
+  if (current?.platform === "win32") return "Windows";
+  if (current?.platform === "darwin") return "macOS";
   return "Linux";
 }
 
 function platformVersionValue(): string {
-  if (process.platform === "win32") return "10.0.0";
-  if (process.platform === "darwin") return "14.0.0";
-  return "";
-}
-
-function secChUaArch(): string {
-  return process.arch === "arm64" ? "arm" : "x86";
+  const current = runtimeProcess();
+  const systemVersion = current?.getSystemVersion?.();
+  const fallback = current?.platform === "win32" ? "10.0.0" : current?.platform === "darwin" ? "14.0.0" : "";
+  const match = (systemVersion || fallback).match(/\d+/g)?.slice(0, 3);
+  if (!match?.length) return "";
+  return match.map((part) => String(Number(part))).join(".");
 }
 
 export function chromeUserAgent(version: string = chromeFullVersion()): string {
   return `Mozilla/5.0 (${platformToken()}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version} Safari/537.36`;
 }
 
+function runtimeLanguages(): string[] {
+  try {
+    const locale = Intl.DateTimeFormat().resolvedOptions().locale.replace(/_/g, "-");
+    const [language] = locale.split("-");
+    if (!locale || !language) return ["en-US", "en"];
+    return language.toLowerCase() === locale.toLowerCase() ? [locale] : [locale, language];
+  } catch {
+    return ["en-US", "en"];
+  }
+}
+
 export function chromeAcceptLanguage(): string {
-  return "zh-CN,zh;q=0.9,en;q=0.8";
+  return runtimeLanguages().map((language, index) => index === 0 ? language : `${language};q=${(1 - index / 10).toFixed(1)}`).join(",");
+}
+
+function runtimeTimeZone(): string {
+  try {
+    const value = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return typeof value === "string" && value.length > 0 ? value : "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
+function navigatorPlatformToken(): string {
+  const current = runtimeProcess();
+  if (current?.platform === "win32") return "Win32";
+  if (current?.platform === "darwin") return "MacIntel";
+  const arch = runtimeArch();
+  if (arch === "arm64") return "Linux aarch64";
+  if (arch === "arm") return "Linux armv7l";
+  if (arch === "ia32") return "Linux i686";
+  if (arch === "ppc64") return "Linux ppc64";
+  if (arch === "s390x") return "Linux s390x";
+  if (arch === "riscv64") return "Linux riscv64";
+  return "Linux x86_64";
+}
+
+function webglIdentity(): Pick<FingerprintProfile, "webglVendor" | "webglRenderer"> {
+  const current = runtimeProcess();
+  if (current?.platform === "darwin") {
+    return isArmRuntime()
+      ? { webglVendor: "Google Inc. (Apple)", webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer, Unspecified Version)" }
+      : { webglVendor: "Google Inc. (Apple)", webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer, Unspecified Version)" };
+  }
+  if (current?.platform === "win32") {
+    return isArmRuntime()
+      ? { webglVendor: "Google Inc. (Microsoft)", webglRenderer: "ANGLE (Microsoft, Direct3D11)" }
+      : { webglVendor: "Google Inc. (ANGLE)", webglRenderer: "ANGLE (Microsoft, Direct3D11)" };
+  }
+  return isArmRuntime()
+    ? { webglVendor: "Google Inc. (Mesa)", webglRenderer: "ANGLE (Mesa, OpenGL ES 3.2)" }
+    : { webglVendor: "Google Inc. (Mesa)", webglRenderer: "ANGLE (Mesa, OpenGL ES 3.2)" };
+}
+
+function fingerprintProfile(version: string = fingerprintVersion): FingerprintProfile {
+  const identity = webglIdentity();
+  return {
+    version,
+    userAgent: chromeUserAgent(version),
+    secPlatform: secChUaPlatform(),
+    navPlatform: navigatorPlatformToken(),
+    platformVersion: platformVersionValue(),
+    architecture: architectureToken(),
+    bitness: architectureBitness(),
+    wow64: wow64Runtime(),
+    timeZone: runtimeTimeZone(),
+    languages: runtimeLanguages(),
+    ...identity,
+  };
 }
 
 export function chromeBrands(major: string): Array<{ brand: string; version: string }> {
@@ -66,10 +181,10 @@ export function chromeClientHintHeaders(version: string = chromeFullVersion()): 
     "sec-ch-ua-full-version-list": secChUaFullVersionList(version),
     "sec-ch-ua-full-version": `"${version}"`,
     "sec-ch-ua-platform-version": `"${platformVersionValue()}"`,
-    "sec-ch-ua-arch": `"${secChUaArch()}"`,
-    "sec-ch-ua-bitness": `"64"`,
+    "sec-ch-ua-arch": `"${architectureToken()}"`,
+    "sec-ch-ua-bitness": `"${architectureBitness()}"`,
     "sec-ch-ua-model": `""`,
-    "sec-ch-ua-wow64": "?0",
+    "sec-ch-ua-wow64": wow64Runtime() ? "?1" : "?0",
   };
 }
 
@@ -112,10 +227,13 @@ export function installFingerprintForSession(targetSession: Session): void {
 }
 
 export function mainWorldFingerprintScript(): string {
+  const profile = JSON.stringify(fingerprintProfile(fingerprintVersion)).replace(/</g, "\\u003c");
   return `(function () {
   "use strict";
   if (window.__sameScreenFingerprintApplied) return;
   window.__sameScreenFingerprintApplied = true;
+
+  var profile = ${profile};
 
   function defineGetter(obj, prop, getter) {
     try {
@@ -133,15 +251,31 @@ export function mainWorldFingerprintScript(): string {
 
   var nav = typeof navigator !== "undefined" ? navigator : null;
   var navProto = nav ? Object.getPrototypeOf(nav) : null;
-  var ua = nav ? (nav.userAgent || "") : "";
-  var chromeMatch = ua.match(/Chrome\\/([0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)/);
-  var full = chromeMatch ? chromeMatch[1] : "142.0.0.0";
+  var full = profile.version;
   var major = full.split(".")[0] || "142";
-  var secPlatform = /Windows/.test(ua) ? "Windows" : /Macintosh/.test(ua) ? "macOS" : "Linux";
-  var navPlatform = /Windows/.test(ua) ? "Win32" : /Macintosh/.test(ua) ? "MacIntel" : "Linux x86_64";
-  var platformVersion = /Windows/.test(ua) ? "10.0.0" : /Macintosh/.test(ua) ? "14.0.0" : "";
-  var osToken = /Windows/.test(ua) ? "Windows NT 10.0; Win64; x64" : /Macintosh/.test(ua) ? "Macintosh; Intel Mac OS X 10_15_7" : "X11; Linux x86_64";
-  var cleanUa = "Mozilla/5.0 (" + osToken + ") AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + full + " Safari/537.36";
+  var secPlatform = profile.secPlatform;
+  var navPlatform = profile.navPlatform;
+  var platformVersion = profile.platformVersion;
+  var cleanUa = profile.userAgent;
+
+  function nearestValue(value, values, fallback) {
+    if (typeof value !== "number" || !isFinite(value) || value <= 0) return fallback;
+    var nearest = values[0];
+    var difference = Math.abs(value - nearest);
+    for (var index = 1; index < values.length; index++) {
+      var nextDifference = Math.abs(value - values[index]);
+      if (nextDifference < difference) { nearest = values[index]; difference = nextDifference; }
+    }
+    return nearest;
+  }
+
+  var languages = profile.languages.length ? profile.languages.slice() : ["en-US", "en"];
+  var language = languages[0];
+  var hardwareConcurrency = nearestValue(nav && nav.hardwareConcurrency, [2, 4, 8, 16], 4);
+  var deviceMemory = nearestValue(nav && nav.deviceMemory, [0.25, 0.5, 1, 2, 4, 8], 8);
+  var fingerprintSeed = 0;
+  var seedSource = [full, profile.timeZone, profile.architecture, profile.bitness].join("|");
+  for (var seedIndex = 0; seedIndex < seedSource.length; seedIndex++) fingerprintSeed = (fingerprintSeed * 31 + seedSource.charCodeAt(seedIndex)) >>> 0;
 
   var brands = [
     { brand: "Chromium", version: major },
@@ -163,13 +297,13 @@ export function mainWorldFingerprintScript(): string {
         brands: brands,
         mobile: false,
         platform: secPlatform,
-        architecture: "x86",
-        bitness: "64",
+        architecture: profile.architecture,
+        bitness: profile.bitness,
         model: "",
         platformVersion: platformVersion,
         uaFullVersion: full,
         fullVersionList: fullVersionList,
-        wow64: false
+        wow64: profile.wow64
       };
       var result = {};
       if (hints && hints.forEach) {
@@ -258,6 +392,120 @@ export function mainWorldFingerprintScript(): string {
   var fakePlugins = arrayLike(pluginList, "[object PluginArray]");
   var fakeMimeTypes = arrayLike(globalMimes, "[object MimeTypeArray]");
 
+  function patchCanvas() {
+    if (typeof HTMLCanvasElement === "undefined") return;
+    var canvasProto = HTMLCanvasElement.prototype;
+    var originalToDataURL = canvasProto.toDataURL;
+    var originalToBlob = canvasProto.toBlob;
+    var copyWithNoise = function (canvas) {
+      try {
+        if (!canvas || canvas.width < 1 || canvas.height < 1 || typeof document === "undefined") return null;
+        var copy = document.createElement("canvas");
+        copy.width = canvas.width;
+        copy.height = canvas.height;
+        var context = copy.getContext("2d");
+        if (!context) return null;
+        context.drawImage(canvas, 0, 0);
+        var pixel = context.getImageData(0, 0, 1, 1);
+        pixel.data[0] = (pixel.data[0] + (fingerprintSeed % 3)) & 255;
+        context.putImageData(pixel, 0, 0);
+        return copy;
+      } catch (e) { return null; }
+    };
+    canvasProto.toDataURL = function () {
+      var copy = copyWithNoise(this);
+      return copy ? originalToDataURL.apply(copy, arguments) : originalToDataURL.apply(this, arguments);
+    };
+    canvasProto.toBlob = function () {
+      var copy = copyWithNoise(this);
+      return originalToBlob.apply(copy || this, arguments);
+    };
+  }
+
+  function patchWebGL() {
+    var contexts = [];
+    if (typeof WebGLRenderingContext !== "undefined") contexts.push(WebGLRenderingContext.prototype);
+    if (typeof WebGL2RenderingContext !== "undefined") contexts.push(WebGL2RenderingContext.prototype);
+    contexts.forEach(function (proto) {
+      var originalGetParameter = proto.getParameter;
+      var originalGetExtension = proto.getExtension;
+      proto.getParameter = function (parameter) {
+        if (parameter === 37445) return profile.webglVendor;
+        if (parameter === 37446) return profile.webglRenderer;
+        return originalGetParameter.apply(this, arguments);
+      };
+      proto.getExtension = function (name) {
+        if (name === "WEBGL_debug_renderer_info") return { UNMASKED_VENDOR_WEBGL: 37445, UNMASKED_RENDERER_WEBGL: 37446 };
+        return originalGetExtension.apply(this, arguments);
+      };
+    });
+  }
+
+  function patchAudio() {
+    if (typeof AnalyserNode !== "undefined") {
+      var proto = AnalyserNode.prototype;
+      var originalFloat = proto.getFloatFrequencyData;
+      var originalByte = proto.getByteFrequencyData;
+      proto.getFloatFrequencyData = function (array) {
+        originalFloat.apply(this, arguments);
+        if (array && array.length) array[0] += (fingerprintSeed % 5) / 1000;
+      };
+      proto.getByteFrequencyData = function (array) {
+        originalByte.apply(this, arguments);
+        if (array && array.length) array[0] = Math.min(255, array[0] + (fingerprintSeed % 2));
+      };
+    }
+    if (typeof OfflineAudioContext !== "undefined") {
+      var offlineProto = OfflineAudioContext.prototype;
+      var originalStartRendering = offlineProto.startRendering;
+      if (typeof originalStartRendering === "function") {
+        offlineProto.startRendering = function () {
+          return originalStartRendering.apply(this, arguments).then(function (buffer) {
+            try {
+              var channel = buffer && buffer.numberOfChannels ? buffer.getChannelData(0) : null;
+              if (channel && channel.length) channel[0] += (fingerprintSeed % 5) / 1000000;
+            } catch (e) {}
+            return buffer;
+          });
+        };
+      }
+    }
+  }
+
+  function patchFontMetrics() {
+    if (typeof CanvasRenderingContext2D === "undefined") return;
+    var proto = CanvasRenderingContext2D.prototype;
+    var originalMeasureText = proto.measureText;
+    proto.measureText = function () {
+      var metrics = originalMeasureText.apply(this, arguments);
+      try {
+        var originalWidth = metrics.width;
+        var normalizedWidth = Math.round(originalWidth * 64) / 64;
+        if (normalizedWidth === originalWidth) return metrics;
+        var clone = Object.create(metrics);
+        defineGetter(clone, "width", function () { return normalizedWidth; });
+        return clone;
+      } catch (e) { return metrics; }
+    };
+  }
+
+  function patchIntl() {
+    try {
+      var originalResolved = Intl.DateTimeFormat.prototype.resolvedOptions;
+      Intl.DateTimeFormat.prototype.resolvedOptions = function () {
+        var options = originalResolved.apply(this, arguments);
+        if (!options.timeZone || options.timeZone === profile.timeZone) options.timeZone = profile.timeZone;
+        return options;
+      };
+    } catch (e) {}
+  }
+
+  patchCanvas();
+  patchWebGL();
+  patchAudio();
+  patchFontMetrics();
+  patchIntl();
+
   var chromeObj = {
     loadTimes: function () {
       var now = Date.now() / 1000;
@@ -304,15 +552,18 @@ export function mainWorldFingerprintScript(): string {
     defineGetter(navProto, "webdriver", function () { return false; });
     defineGetter(navProto, "plugins", function () { return fakePlugins; });
     defineGetter(navProto, "mimeTypes", function () { return fakeMimeTypes; });
-    defineGetter(navProto, "languages", function () { return ["zh-CN", "zh", "en"]; });
-    defineGetter(navProto, "language", function () { return "zh-CN"; });
+    defineGetter(navProto, "languages", function () { return languages.slice(); });
+    defineGetter(navProto, "language", function () { return language; });
     defineGetter(navProto, "platform", function () { return navPlatform; });
     defineGetter(navProto, "vendor", function () { return "Google Inc."; });
-    defineGetter(navProto, "deviceMemory", function () { return 8; });
+    defineGetter(navProto, "hardwareConcurrency", function () { return hardwareConcurrency; });
+    defineGetter(navProto, "deviceMemory", function () { return deviceMemory; });
     defineGetter(navProto, "appVersion", function () { return cleanUa.replace(/^Mozilla\\//, ""); });
   }
 
-  defineGetter(window, "outerWidth", function () { return window.innerWidth; });
-  defineGetter(window, "outerHeight", function () { return window.innerHeight + 120; });
+  var frameWidth = Math.max(0, window.outerWidth - window.innerWidth);
+  var frameHeight = Math.max(0, window.outerHeight - window.innerHeight);
+  defineGetter(window, "outerWidth", function () { return window.innerWidth + frameWidth; });
+  defineGetter(window, "outerHeight", function () { return window.innerHeight + frameHeight; });
 })();`;
 }

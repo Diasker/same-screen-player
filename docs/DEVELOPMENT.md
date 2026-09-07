@@ -90,6 +90,10 @@ Cloudflare 挑战识别、Turnstile 资源放行、循环检测和 Electron 指�
 
 Cloudflare detection, Turnstile resource allow rules, loop detection, and Electron fingerprint injection live in `cloudflare.ts`, `main.ts`, `guest-preload.ts`, and `fingerprint.ts`. Chrome DevTools Protocol code serves Google sign-in only. The general “Open in Chrome” fallback handles restricted playback pages and does not import Cloudflare Cookies.
 
+指纹 profile 基于当前运行时的系统版本、架构、位数、语言、时区和内置 Chromium 版本动态生成；Session 请求头和页面 JavaScript 使用同一 profile。页面层同步处理 `navigator`/Client Hints、插件、Canvas 导出、WebGL、普通与离线音频、字体测量和时区；屏幕与窗口尺寸保留真实设备数据，避免固定分辨率造成新的不一致。真实系统字体检测保持原样，以免影响网页字体加载。它用于降低 Electron 与 Chrome 的明显差异，不能保证绕过所有站点的风险控制。
+
+The fingerprint profile is generated from the current runtime's platform version, architecture, bitness, language, time zone, and embedded Chromium version; Session headers and page JavaScript share it. The page layer aligns navigator/Client Hints, plugins, Canvas export, WebGL, live and offline audio, font metrics, and time zone; native display and window dimensions stay intact to avoid a new inconsistency from fixed resolutions. Native system-font checks remain intact so page font loading continues to work. It reduces obvious Electron-versus-Chrome differences but does not guarantee bypassing site risk controls.
+
 ## 数据与持久化 / Data and persistence
 
 - `layout.json`：只保存布局树和版本号，不保存网页地址。

@@ -16,6 +16,7 @@ describe("Chrome fingerprint helpers", () => {
     expect(ua).toContain("Chrome/");
     expect(ua).toContain(chromeFullVersion());
     expect(ua).not.toContain("Electron");
+    if (process.arch === "arm64" || process.arch === "arm") expect(ua).not.toContain("Linux x86_64");
   });
 
   it("builds Chrome-branded client hint headers without Electron", () => {
@@ -27,6 +28,10 @@ describe("Chrome fingerprint helpers", () => {
     expect(headers["sec-ch-ua-full-version-list"]).not.toContain("Electron");
     expect(headers["sec-ch-ua-mobile"]).toBe("?0");
     expect(headers["sec-ch-ua-platform"]).toBe(`"${secChUaPlatform()}"`);
+    const expectedArchitecture = process.arch === "arm64" || process.arch === "arm" ? "arm" : "x86";
+    const expectedBitness = process.arch === "x64" || process.arch === "arm64" ? "64" : "32";
+    expect(headers["sec-ch-ua-arch"]).toBe(`"${expectedArchitecture}"`);
+    expect(headers["sec-ch-ua-bitness"]).toBe(`"${expectedBitness}"`);
   });
 
   it("replaces client hint headers case-insensitively", () => {
@@ -66,11 +71,17 @@ describe("Chrome fingerprint helpers", () => {
 
   it("produces a self-contained main-world script without Electron references", () => {
     const script = mainWorldFingerprintScript();
+    const expectedArchitecture = process.arch === "arm64" || process.arch === "arm" ? "arm" : "x86";
+    const expectedBitness = process.arch === "x64" || process.arch === "arm64" ? "64" : "32";
     expect(typeof script).toBe("string");
     expect(script.length).toBeGreaterThan(1000);
-    for (const marker of ["userAgentData", "plugins", "mimeTypes", "webdriver", "chrome", "outerWidth"]) {
+    for (const marker of ["userAgentData", "plugins", "mimeTypes", "webdriver", "chrome", "outerWidth", "profile.architecture", "profile.languages", "hardwareConcurrency", "patchCanvas", "patchWebGL", "patchAudio", "patchFontMetrics", "patchIntl"]) {
       expect(script).toContain(marker);
     }
     expect(script).not.toContain("Electron");
+    expect(script).not.toContain('architecture: "x86"');
+    expect(script).toContain(`"architecture":"${expectedArchitecture}"`);
+    expect(script).toContain(`"bitness":"${expectedBitness}"`);
+    expect(() => new Function(script)).not.toThrow();
   });
 });
