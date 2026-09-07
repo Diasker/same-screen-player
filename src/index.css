@@ -113,8 +113,6 @@ button { cursor: pointer; }
 .pane-notice .icon-button { pointer-events: auto; }
 .pane-badge { position: absolute; z-index: 6; top: 8px; right: 8px; padding: 4px 7px; border: 1px solid #344354; border-radius: 5px; color: #a7b5c6; background: #111923eF; font-size: calc(10px * var(--app-font-scale)); opacity: .86; }
 .pane-badge:hover { border-color: #5d7698; color: #e3ebf5; background: #253347; }
-.local-video-quick-button { position: absolute; z-index: 7; top: 8px; right: 8px; padding: 4px 7px; border: 1px solid #3b837e; border-radius: 5px; color: #78dfca; background: #17332fef; font-size: calc(10px * var(--app-font-scale)); }
-.local-video-quick-button:hover { border-color: #69d6bf; background: #1e4640; }
 .status-bar { height: 27px; display: flex; align-items: center; gap: 7px; padding: 0 14px; border-top: 1px solid #202936; color: #7d8999; background: #10161f; font-size: calc(10px * var(--app-font-scale)); }
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: #62cfad; box-shadow: 0 0 7px #62cfad; }
 .status-spacer { flex: 1; }

@@ -37,8 +37,8 @@ Playback uses embedded Electron `<webview>` elements. The real Chrome browser is
 
 ### 启动与打开页面 / Start and open pages
 
-- 中文：在空白分屏输入 `http://` 或 `https://` 地址并点击“播放”，或点击“打开本地视频”选择一个本机文件。播放时可从应用控制栏选择“本地视频”替换内容；网页操作模式下，每格右上角也有同名快捷按钮。
-- English: Enter an `http://` or `https://` address in an empty pane and click “播放 / Play”, or use “打开本地视频 / Open local video” to select a file. Replace a playing pane from App controls or the top-right shortcut in Web mode.
+- 中文：在空白分屏输入 `http://` 或 `https://` 地址并点击“播放”，或点击“打开本地视频”选择一个本机文件。播放中的分屏可切换到“应用操作”后，从控制栏选择“本地视频”替换内容。
+- English: Enter an `http://` or `https://` address in an empty pane and click “播放 / Play”, or use “打开本地视频 / Open local video” to select a file. To replace a playing pane, switch to App mode and choose “本地视频” from its controls.
 
 本地视频仅支持 MP4、M4V、WebM、MOV 和 OGV 容器；具体编码取决于 Electron 内置 Chromium。文件路径不会保存到布局，重启后不会自动重新打开本地视频。
 

@@ -350,8 +350,10 @@ function PaneView(props: PaneViewProps): ReactElement {
     if (runtime.mediaSource === "local") {
       void window.desktop.loadLocalVideo(runtime.paneId, runtime.url).then((result) => {
         const value = result as { ok?: boolean; message?: string };
-        if (!value.ok) onUpdateRef.current({ playerStatus: "blocked", error: value.message || "本地视频无法加载" });
-      }).catch(() => onUpdateRef.current({ playerStatus: "blocked", error: "本地视频无法加载" }));
+        if (!value.ok && runtimeRef.current.mediaSource === "local" && runtimeRef.current.url === runtime.url && !runtimeRef.current.playback.hasVideo) onUpdateRef.current({ playerStatus: "blocked", error: value.message || "本地视频无法加载" });
+      }).catch(() => {
+        if (runtimeRef.current.mediaSource === "local" && runtimeRef.current.url === runtime.url && !runtimeRef.current.playback.hasVideo) onUpdateRef.current({ playerStatus: "blocked", error: "本地视频无法加载" });
+      });
       return;
     }
     try {
@@ -407,7 +409,12 @@ function PaneView(props: PaneViewProps): ReactElement {
         const playback = normalizePlayback(value, currentRuntime.playback);
         const patch: Partial<PaneRuntime> = { playback, playing: playback.playing, muted: playback.muted };
         if (typeof value.userPauseIntent === "boolean") patch.userPauseIntent = value.userPauseIntent;
-        if (currentRuntime.playerStatus === "idle" || currentRuntime.playerStatus === "loading") patch.playerStatus = playback.hasVideo ? "ready" : "loading";
+        if (playback.hasVideo) {
+          patch.playerStatus = "ready";
+          patch.error = undefined;
+        } else if (currentRuntime.playerStatus === "idle" || currentRuntime.playerStatus === "loading") {
+          patch.playerStatus = "loading";
+        }
         onUpdateRef.current(patch);
         return;
       }
@@ -464,8 +471,10 @@ function PaneView(props: PaneViewProps): ReactElement {
           if (latestRuntime.mediaSource === "local") {
             void window.desktop.loadLocalVideo(latestRuntime.paneId, latestRuntime.url).then((result) => {
               const value = result as { ok?: boolean; message?: string };
-              if (!value.ok) onUpdateRef.current({ playerStatus: "blocked", error: value.message || "本地视频无法加载" });
-            }).catch(() => onUpdateRef.current({ playerStatus: "blocked", error: "本地视频无法加载" }));
+              if (!value.ok && runtimeRef.current.mediaSource === "local" && runtimeRef.current.url === latestRuntime.url && !runtimeRef.current.playback.hasVideo) onUpdateRef.current({ playerStatus: "blocked", error: value.message || "本地视频无法加载" });
+            }).catch(() => {
+              if (runtimeRef.current.mediaSource === "local" && runtimeRef.current.url === latestRuntime.url && !runtimeRef.current.playback.hasVideo) onUpdateRef.current({ playerStatus: "blocked", error: "本地视频无法加载" });
+            });
             return;
           }
           try {
@@ -486,6 +495,7 @@ function PaneView(props: PaneViewProps): ReactElement {
       const failure = event as Event & { errorDescription?: string; errorCode?: number; isMainFrame?: boolean };
       if (failure.isMainFrame === false || failure.errorCode === -3) return;
       const localFailure = runtimeRef.current.mediaSource === "local";
+      if (localFailure && runtimeRef.current.playback.hasVideo) return;
       onUpdateRef.current({ playerStatus: "blocked", error: localFailure ? "本地视频无法加载，请确认文件未被删除、可访问且编码受支持" : failure.errorDescription || "页面加载失败" });
     };
     const onProcessGone = () => onUpdateRef.current({ playerStatus: "crashed", error: "网页进程已崩溃，请重新加载" });
@@ -789,7 +799,6 @@ function PaneView(props: PaneViewProps): ReactElement {
           {!isLocalVideo && runtime.playerStatus === "blocked" && <button className="icon-button warning" onClick={props.onOpenChrome}>用 Chrome 打开</button>}
         </div>
       )}
-      {runtime.url && props.interactionMode === "web" && <button className="local-video-quick-button" onPointerDown={(event) => event.stopPropagation()} onClick={() => void selectLocalVideo()}>本地视频</button>}
       {runtime.url && props.interactionMode === "app" && !showControls && <button className="pane-badge" onPointerDown={(event) => event.stopPropagation()} onClick={revealControls}>{runtime.error ? "播放受限" : runtime.playerStatus === "unrecognized" ? "播放器未识别" : runtime.playing ? "播放中" : "已暂停"} · 控制</button>}
     </div>
   );
