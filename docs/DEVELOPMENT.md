@@ -64,9 +64,15 @@ Electron proxies are Session-scoped. A shared Session cannot carry different pro
 - Web mode sends mouse and keyboard input to the webview so links, inputs, and native players remain usable.
 - App mode routes pointer handling to the layout layer for app controls, pane dragging, and the context menu.
 
+### Embedded iframe video
+
+The main process injects a media-only bridge into child frames through `WebFrameMain` and the existing CDP document-start hook without enabling Node integration. HTML5 video state is forwarded through validated `postMessage` events, while play, pause, seek, volume, mute, and speed commands are routed back to the active frame. Nested frames forward the same bridge messages to the top-level guest preload, and stale frame state expires automatically.
+
 ### Local video
 
 Local video uses the system picker for one `MP4`, `M4V`, `WebM`, `MOV`, or `OGV` file. Both App and Web modes can replace the current pane. Local sources reuse player controls while hiding network-only features such as proxy, session, ad blocking, sign-in, and Chrome fallback. Deleted, inaccessible, or unsupported media reports an error only in its own pane.
+
+In App mode, the local pane keeps its filename label and exposes a network URL field, so switching back to a webpage does not require creating another pane.
 
 ### Cloudflare and Chrome boundary
 

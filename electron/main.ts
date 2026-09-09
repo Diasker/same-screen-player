@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, screen, session, webContents } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, screen, session, webContents, webFrameMain } from "electron";
 import { ElectronBlocker } from "@ghostery/adblocker-electron";
 import { existsSync, promises as fs } from "node:fs";
 import path from "node:path";
@@ -32,6 +32,7 @@ import {
 import { ChromeSessionManager } from "./cdp";
 import { chromeUserAgent, installFingerprintForSession, mainWorldFingerprintScript } from "./fingerprint";
 import { helperPath, WindowsWindowHelper } from "./windows-helper";
+import { frameVideoBridgeScript } from "./frame-video-bridge";
 import { debugOverlaysEnabled } from "../src/shared/debug-overlays";
 
 app.userAgentFallback = chromeUserAgent();
@@ -51,7 +52,9 @@ const paneProxySettings = new Map<string, PaneProxySettings>();
 const paneHosts = new Map<string, string>();
 type BeforeInputListener = (event: Electron.Event, input: Electron.Input) => void;
 type NavigationListener = (event: Electron.Event, url: string) => void;
-const guestBindings = new Map<number, { paneId: string; contents: Electron.WebContents; onBeforeInput: BeforeInputListener; onEnterFullscreen: () => void; onLeaveFullscreen: () => void; onWillNavigate: NavigationListener; onNavigate: NavigationListener; onNavigateInPage: NavigationListener; onDestroyed: () => void }>();
+type FrameCreatedListener = (event: Electron.Event, details: Electron.FrameCreatedDetails) => void;
+type FrameFinishListener = (event: Electron.Event, isMainFrame: boolean, frameProcessId: number, frameRoutingId: number) => void;
+const guestBindings = new Map<number, { paneId: string; contents: Electron.WebContents; onBeforeInput: BeforeInputListener; onEnterFullscreen: () => void; onLeaveFullscreen: () => void; onWillNavigate: NavigationListener; onNavigate: NavigationListener; onNavigateInPage: NavigationListener; onFrameCreated: FrameCreatedListener; onFrameFinish: FrameFinishListener; onDestroyed: () => void }>();
 const disabledAdblockRules = new Set<string>();
 const disabledAdblockPanes = new Set<string>();
 const challengeNavigation = new Map<string, ChallengeNavigationState>();
@@ -325,6 +328,8 @@ function unbindGuest(webContentsId: number): void {
   binding.contents.removeListener("will-navigate", binding.onWillNavigate);
   binding.contents.removeListener("did-navigate", binding.onNavigate);
   binding.contents.removeListener("did-navigate-in-page", binding.onNavigateInPage);
+  binding.contents.removeListener("frame-created", binding.onFrameCreated);
+  binding.contents.removeListener("did-frame-finish-load", binding.onFrameFinish);
   binding.contents.removeListener("destroyed", binding.onDestroyed);
   guestBindings.delete(webContentsId);
   paneWebContents.delete(webContentsId);
@@ -342,7 +347,7 @@ function installDebuggerInjection(contents: Electron.WebContents): void {
   try {
     contents.debugger.attach("1.3");
     void contents.debugger.sendCommand("Page.enable")
-      .then(() => contents.debugger.sendCommand("Page.addScriptToEvaluateOnNewDocument", { source: mainWorldFingerprintScript() }))
+      .then(() => contents.debugger.sendCommand("Page.addScriptToEvaluateOnNewDocument", { source: `${mainWorldFingerprintScript()}\n${frameVideoBridgeScript()}` }))
       .then(() => {
         // Detach once the script is registered to avoid keeping the DevTools
         // debugger attached to the guest, which can interfere with site input
@@ -356,6 +361,18 @@ function installDebuggerInjection(contents: Electron.WebContents): void {
   }
 }
 
+function installFrameVideoBridge(frame: Electron.WebFrameMain | null): void {
+  if (!frame || frame.isDestroyed()) return;
+  void frame.executeJavaScript(frameVideoBridgeScript(), false).catch(() => undefined);
+}
+
+function installFrameVideoBridges(contents: Electron.WebContents): void {
+  try {
+    contents.mainFrame.framesInSubtree.forEach(installFrameVideoBridge);
+  } catch {
+  }
+}
+
 function bindGuest(paneId: string, webContentsId: number): void {
   const contents = webContents.fromId(webContentsId);
   if (!contents || contents.isDestroyed()) return;
@@ -363,6 +380,7 @@ function bindGuest(paneId: string, webContentsId: number): void {
   if (existing && existing.paneId === paneId) return;
   if (existing) unbindGuest(webContentsId);
   installDebuggerInjection(contents);
+  installFrameVideoBridges(contents);
   const onBeforeInput: BeforeInputListener = (event, input) => {
     if (input.type !== "keyDown") return;
     const isSpace = input.code === "Space" || input.key === " ";
@@ -417,6 +435,8 @@ function bindGuest(paneId: string, webContentsId: number): void {
   };
   const onNavigate = (_event: Electron.Event, url: string) => handlePaneNavigation(paneId, contents, url);
   const onNavigateInPage = (_event: Electron.Event, url: string) => handlePaneNavigation(paneId, contents, url);
+  const onFrameCreated: FrameCreatedListener = (_event, details) => installFrameVideoBridge(details.frame);
+  const onFrameFinish: FrameFinishListener = (_event, _isMainFrame, frameProcessId, frameRoutingId) => installFrameVideoBridge(webFrameMain.fromId(frameProcessId, frameRoutingId) ?? null);
   const onDestroyed = () => unbindGuest(webContentsId);
   contents.on("before-input-event", onBeforeInput);
   contents.on("enter-html-full-screen", onEnterFullscreen);
@@ -424,8 +444,10 @@ function bindGuest(paneId: string, webContentsId: number): void {
   contents.on("will-navigate", onWillNavigate);
   contents.on("did-navigate", onNavigate);
   contents.on("did-navigate-in-page", onNavigateInPage);
+  contents.on("frame-created", onFrameCreated);
+  contents.on("did-frame-finish-load", onFrameFinish);
   contents.on("destroyed", onDestroyed);
-  guestBindings.set(webContentsId, { paneId, contents, onBeforeInput, onEnterFullscreen, onLeaveFullscreen, onWillNavigate, onNavigate, onNavigateInPage, onDestroyed });
+  guestBindings.set(webContentsId, { paneId, contents, onBeforeInput, onEnterFullscreen, onLeaveFullscreen, onWillNavigate, onNavigate, onNavigateInPage, onFrameCreated, onFrameFinish, onDestroyed });
 }
 
 async function loadLayout(): Promise<PersistedLayout> {

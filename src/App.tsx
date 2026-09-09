@@ -301,7 +301,7 @@ function PaneView(props: PaneViewProps): ReactElement {
     }
   }, [navigationState.canGoBack, navigationState.canGoForward]);
 
-  useEffect(() => setDraftUrl(runtime.mediaSource === "local" ? runtime.localFileName ?? "" : runtime.url), [runtime.localFileName, runtime.mediaSource, runtime.url]);
+  useEffect(() => setDraftUrl(runtime.mediaSource === "local" ? "" : runtime.url), [runtime.mediaSource, runtime.url]);
 
   useEffect(() => {
     const webview = webviewRef.current;
@@ -589,7 +589,7 @@ function PaneView(props: PaneViewProps): ReactElement {
       if (!result.canceled) props.onUpdate({ error: result.message || "无法打开本地视频" });
       return;
     }
-    setDraftUrl(result.fileName);
+    setDraftUrl("");
     setNavigationState({ canGoBack: false, canGoForward: false });
     props.onUpdate({ url: result.url, mediaSource: "local", localFileName: result.fileName, error: undefined, playerStatus: "loading", playback: emptyPlayback(), playing: false, userPauseIntent: false, focusModeEnabled: false, cloudflareStatus: "none" });
     setShowControls(false);
@@ -606,7 +606,7 @@ function PaneView(props: PaneViewProps): ReactElement {
     setSeekDraft(null);
   };
   const togglePlay = () => {
-    sendCommand({ type: "toggle" });
+    sendCommand({ type: runtime.playing ? "pause" : "play" });
     props.onUpdate({ userPauseIntent: runtime.playing });
   };
   const toggleMute = () => {
@@ -750,10 +750,9 @@ function PaneView(props: PaneViewProps): ReactElement {
             </div>
           )}
           <div className="pane-url-row">
-            {isLocalVideo ? <div className="local-file-label" title={runtime.localFileName}>{runtime.localFileName || "本地视频"}</div> : <><button className="icon-button history-button" onClick={() => navigateHistory("back")} disabled={!navigationState.canGoBack} aria-label="后退" title="后退">后退</button><button className="icon-button history-button" onClick={() => navigateHistory("forward")} disabled={!navigationState.canGoForward} aria-label="前进" title="前进">前进</button><input aria-label="视频网址" value={draftUrl} onChange={(event) => setDraftUrl(event.target.value)} onKeyDown={(event) => event.key === "Enter" && submitUrl()} placeholder="输入视频网址…" /><button className="icon-button primary" onClick={submitUrl}>打开</button></>}
+            {isLocalVideo ? <><div className="local-file-label" title={runtime.localFileName}>{runtime.localFileName || "本地视频"}</div><input aria-label="网页视频网址" value={draftUrl} onChange={(event) => setDraftUrl(event.target.value)} onKeyDown={(event) => event.key === "Enter" && submitUrl()} placeholder="粘贴网页视频地址…" /><button className="icon-button primary" onClick={submitUrl}>打开网页</button></> : <><button className="icon-button history-button" onClick={() => navigateHistory("back")} disabled={!navigationState.canGoBack} aria-label="后退" title="后退">后退</button><button className="icon-button history-button" onClick={() => navigateHistory("forward")} disabled={!navigationState.canGoForward} aria-label="前进" title="前进">前进</button><input aria-label="视频网址" value={draftUrl} onChange={(event) => setDraftUrl(event.target.value)} onKeyDown={(event) => event.key === "Enter" && submitUrl()} placeholder="输入视频网址…" /><button className="icon-button primary" onClick={submitUrl}>打开</button></>}
           </div>
           <div className="pane-actions">
-            <button className="icon-button" onClick={() => { sendCommand({ type: "pause" }); props.onUpdate({ userPauseIntent: true }); }}>暂停</button>
             <button className="icon-button" onClick={reloadPane}>刷新</button>
             <button className="icon-button" onClick={() => void selectLocalVideo()}>本地视频</button>
             {!isLocalVideo && <button className={`icon-button ${runtime.adblockEnabled ? "selected" : "warning"}`} onClick={() => void toggleAdblock()}>{runtime.adblockEnabled ? "拦截" : "放行"}</button>}

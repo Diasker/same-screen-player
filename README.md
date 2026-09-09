@@ -19,6 +19,7 @@ Playback uses embedded Electron `<webview>` elements. The real Chrome browser is
 - Panes share a login session by default. Selecting a pane-specific proxy automatically switches that pane to an isolated Session and warns about Cookie isolation.
 - Cloudflare challenge resources remain available inside Electron panes, while browser fingerprint emulation helps most sites complete verification; automatic refresh stops when a loop is detected.
 - Use the system file picker to play one local MP4, M4V, WebM, MOV, or OGV video with the existing play, seek, volume, and speed controls.
+- Supported HTML5 players inside same-origin, cross-origin, or nested iframes can reuse the application play, seek, volume, mute, and speed controls.
 
 ## Usage
 
@@ -27,6 +28,8 @@ Playback uses embedded Electron `<webview>` elements. The real Chrome browser is
 Enter an `http://` or `https://` address in an empty pane and click **Play**, or use **Open local video** to select a file. To replace a playing pane, switch to App mode and choose **Local video** from its controls.
 
 Local video selection accepts MP4, M4V, WebM, MOV, and OGV containers; actual codec support depends on Electron's embedded Chromium. File paths are never saved in the layout, so local videos do not reopen after restart.
+
+When a local video is active, use the webpage address field in the App-mode control bar to switch the same pane back to a network page.
 
 ### Interaction modes
 

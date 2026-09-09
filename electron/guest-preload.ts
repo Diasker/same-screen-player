@@ -36,6 +36,11 @@ type PlaybackSnapshot = {
   rate: number;
 };
 
+type RemoteFrameState = {
+  state: PlaybackSnapshot;
+  receivedAt: number;
+};
+
 type PlayerStatus = "idle" | "loading" | "ready" | "unrecognized" | "challenge";
 
 let paneActive = true;
@@ -52,6 +57,7 @@ let lastStatus: PlayerStatus | null = null;
 let lastStatusMessage = "";
 let lastSnapshot: PlaybackSnapshot | null = null;
 let suppressPauseIntent = false;
+let playRequestVersion = 0;
 let lastUserInteractionAt = 0;
 let controlsVisible = false;
 let targetMissingSince = 0;
@@ -62,6 +68,9 @@ let cloudflareNavigation: ChallengeNavigationState = emptyChallengeNavigation();
 let lastChallengeMessage = "";
 const boundVideos = new WeakSet<HTMLVideoElement>();
 const wasPlaying = new WeakMap<HTMLVideoElement, boolean>();
+const remoteFrameStates = new Map<HTMLIFrameElement, RemoteFrameState>();
+const remoteFrameMuteSynced = new WeakSet<HTMLIFrameElement>();
+const FRAME_VIDEO_SOURCE = "same-screen-frame-video";
 
 function sendChallengeState(status: CloudflareStatus, url?: string, navigationCount?: number, message?: string): void {
   const nextUrl = url ?? "";
@@ -245,22 +254,25 @@ function detectPlayer(): PlayerTarget | null {
     return b.width * b.height - a.width * a.height;
   })[0] ?? videos[0] ?? null;
   if (video && isPlayerSized(video)) return { root: findPlayerContainer(video), video, site: "generic" };
-  const frame = largestVisibleFrame();
+  const frame = visibleFrames().find((candidate) => Boolean(remoteFramePlayback(candidate))) ?? largestVisibleFrame();
   if (frame) return { root: frame, video: null, site: "generic", frame };
   return null;
 }
 
-function largestVisibleFrame(): HTMLIFrameElement | null {
-  const frames = Array.from(document.querySelectorAll("iframe")).filter((frame) => {
+function visibleFrames(): HTMLIFrameElement[] {
+  return queryAllDeep<HTMLIFrameElement>("iframe").filter((frame) => {
     if (!isVisible(frame)) return false;
     const rect = frame.getBoundingClientRect();
     return rect.width >= window.innerWidth * 0.25 && rect.height >= window.innerHeight * 0.25;
-  });
-  return frames.sort((left, right) => {
+  }).sort((left, right) => {
     const a = left.getBoundingClientRect();
     const b = right.getBoundingClientRect();
     return b.width * b.height - a.width * a.height;
-  })[0] ?? null;
+  });
+}
+
+function largestVisibleFrame(): HTMLIFrameElement | null {
+  return visibleFrames()[0] ?? null;
 }
 
 type ChallengeDetection = { message: string; url: string };
@@ -416,10 +428,86 @@ function getBuffered(video: HTMLVideoElement): number {
   }
 }
 
+function normalizeRemoteFrameState(value: unknown): PlaybackSnapshot | null {
+  if (!value || typeof value !== "object") return null;
+  const next = value as Partial<PlaybackSnapshot>;
+  if (typeof next.hasVideo !== "boolean") return null;
+  return {
+    playing: Boolean(next.playing),
+    currentTime: typeof next.currentTime === "number" && Number.isFinite(next.currentTime) ? Math.max(0, next.currentTime) : 0,
+    duration: typeof next.duration === "number" && Number.isFinite(next.duration) ? Math.max(0, next.duration) : 0,
+    buffered: typeof next.buffered === "number" && Number.isFinite(next.buffered) ? Math.max(0, next.buffered) : 0,
+    volume: typeof next.volume === "number" && Number.isFinite(next.volume) ? Math.min(1, Math.max(0, next.volume)) : 1,
+    muted: Boolean(next.muted),
+    hasVideo: next.hasVideo,
+    videoWidth: typeof next.videoWidth === "number" && Number.isFinite(next.videoWidth) ? Math.max(0, next.videoWidth) : 0,
+    videoHeight: typeof next.videoHeight === "number" && Number.isFinite(next.videoHeight) ? Math.max(0, next.videoHeight) : 0,
+    readyState: typeof next.readyState === "number" && Number.isFinite(next.readyState) ? Math.max(0, next.readyState) : 0,
+    playerWidth: 0,
+    playerHeight: 0,
+    rate: typeof next.rate === "number" && Number.isFinite(next.rate) && next.rate > 0 ? Math.min(4, Math.max(0.25, next.rate)) : 1,
+  };
+}
+
+function remoteFramePlayback(frame: HTMLIFrameElement | null): PlaybackSnapshot | null {
+  if (!frame) return null;
+  const entry = remoteFrameStates.get(frame);
+  if (!entry || Date.now() - entry.receivedAt > 3000 || !entry.state.hasVideo) return null;
+  return entry.state;
+}
+
+function frameForMessage(source: MessageEventSource | null): HTMLIFrameElement | null {
+  if (!source) return null;
+  return queryAllDeep<HTMLIFrameElement>("iframe").find((frame) => frame.contentWindow === source) ?? null;
+}
+
+function receiveFrameVideoMessage(event: MessageEvent): void {
+  const value = event.data as { source?: unknown; kind?: unknown; state?: unknown } | null;
+  if (!value || value.source !== FRAME_VIDEO_SOURCE || value.kind !== "state") return;
+  const frame = frameForMessage(event.source);
+  if (!frame) return;
+  const state = normalizeRemoteFrameState(value.state);
+  if (!state) return;
+  remoteFrameStates.set(frame, { state, receivedAt: Date.now() });
+  if (!remoteFrameMuteSynced.has(frame)) {
+    remoteFrameMuteSynced.add(frame);
+    if (state.muted !== paneMuted) sendFrameVideoCommand(frame, { type: "setMuted", value: paneMuted });
+  }
+  scheduleDetection();
+  reportPlayback();
+}
+
+function sendFrameVideoCommand(frame: HTMLIFrameElement, command: VideoCommand): void {
+  try {
+    frame.contentWindow?.postMessage({ source: FRAME_VIDEO_SOURCE, command }, "*");
+  } catch {
+  }
+}
+
+type MediaTarget =
+  | { kind: "local"; video: HTMLVideoElement }
+  | { kind: "frame"; frame: HTMLIFrameElement; state: PlaybackSnapshot };
+
+function mediaTarget(): MediaTarget | null {
+  const target = focusTarget ?? detectPlayer();
+  if (!target) return null;
+  if (target.video) return { kind: "local", video: target.video };
+  if (target.frame) {
+    const state = remoteFramePlayback(target.frame);
+    if (state) return { kind: "frame", frame: target.frame, state };
+  }
+  return null;
+}
+
 function snapshot(): PlaybackSnapshot {
-  const video = focusTarget?.video ?? detectPlayer()?.video;
-  if (!video) return { playing: false, currentTime: 0, duration: 0, buffered: 0, volume: 1, muted: paneMuted, hasVideo: false, videoWidth: 0, videoHeight: 0, readyState: 0, playerWidth: 0, playerHeight: 0, rate: 1 };
-  const playerRect = focusTarget?.root.getBoundingClientRect();
+  const target = focusTarget ?? detectPlayer();
+  if (!target) return { playing: false, currentTime: 0, duration: 0, buffered: 0, volume: 1, muted: paneMuted, hasVideo: false, videoWidth: 0, videoHeight: 0, readyState: 0, playerWidth: 0, playerHeight: 0, rate: 1 };
+  const playerRect = target.root.getBoundingClientRect();
+  const remote = target.frame ? remoteFramePlayback(target.frame) : null;
+  const video = target.video;
+  if (!video && !remote) return { playing: false, currentTime: 0, duration: 0, buffered: 0, volume: 1, muted: paneMuted, hasVideo: false, videoWidth: 0, videoHeight: 0, readyState: 0, playerWidth: playerRect.width, playerHeight: playerRect.height, rate: 1 };
+  if (!video && remote) return { ...remote, playerWidth: playerRect.width, playerHeight: playerRect.height };
+  if (!video) return { playing: false, currentTime: 0, duration: 0, buffered: 0, volume: 1, muted: paneMuted, hasVideo: false, videoWidth: 0, videoHeight: 0, readyState: 0, playerWidth: playerRect.width, playerHeight: playerRect.height, rate: 1 };
   return {
     playing: !video.paused && !video.ended,
     currentTime: Number.isFinite(video.currentTime) ? video.currentTime : 0,
@@ -554,6 +642,7 @@ function detectAndApply(): void {
     if (unrecognizedTimer !== null) window.clearTimeout(unrecognizedTimer);
     unrecognizedTimer = null;
     const pinnable = Boolean(target.video || target.frame);
+    const remoteVideo = target.frame ? remoteFramePlayback(target.frame) : null;
     const shouldApply = focusModeEnabled && pinnable && !hasDialog && !nativeFullscreen;
     if (shouldApply) applyFocus(target);
     else restoreFocus();
@@ -563,14 +652,15 @@ function detectAndApply(): void {
       rootTag: target.root.tagName,
       rootId: target.root.id || "",
       rootClass: typeof target.root.className === "string" ? target.root.className.slice(0, 90) : "",
-      videoFound: Boolean(target.video),
+      videoFound: Boolean(target.video || remoteVideo),
+      frameVideoFound: Boolean(remoteVideo),
       frameFound: Boolean(target.frame),
       focusModeEnabled,
       dialog: hasDialog,
       fullscreen: nativeFullscreen,
       applied: shouldApply,
     });
-    sendStatus(target.video ? "ready" : "loading");
+    sendStatus(target.video || remoteVideo ? "ready" : "loading");
     attachVideos();
     reportPlayback();
     return;
@@ -612,19 +702,31 @@ function scheduleDetection(): void {
 
 function setMuted(muted: boolean): void {
   paneMuted = muted;
-  const primary = focusTarget?.video ?? detectPlayer()?.video;
-  if (primary) primary.muted = muted;
+  const target = mediaTarget();
+  if (target?.kind === "local") target.video.muted = muted;
+  else if (target?.kind === "frame") sendFrameVideoCommand(target.frame, { type: "setMuted", value: muted });
   else queryAllDeep<HTMLVideoElement>("video").forEach((video) => { video.muted = muted; });
   reportPlayback();
 }
 
 function runCommand(command: VideoCommand): void {
-  const video = focusTarget?.video ?? detectPlayer()?.video;
-  if (!video) return;
+  const requestVersion = ++playRequestVersion;
+  const target = mediaTarget();
+  if (!target) return;
+  if (target.kind === "frame") {
+    if (command.type === "pause") userPauseIntent = true;
+    else if (command.type === "play") userPauseIntent = false;
+    else if (command.type === "toggle") userPauseIntent = target.state.playing;
+    else if (command.type === "toggleMuted") sendFrameVideoCommand(target.frame, { type: "setMuted", value: !target.state.muted });
+    else sendFrameVideoCommand(target.frame, command);
+    reportPlayback();
+    return;
+  }
+  const video = target.video;
   try {
     if (command.type === "play") {
       userPauseIntent = false;
-      void video.play().catch(() => undefined);
+      playVideo(video, requestVersion);
     } else if (command.type === "pause") {
       userPauseIntent = true;
       suppressPauseIntent = true;
@@ -633,7 +735,7 @@ function runCommand(command: VideoCommand): void {
     } else if (command.type === "toggle") {
       if (video.paused || video.ended) {
         userPauseIntent = false;
-        void video.play().catch(() => undefined);
+        playVideo(video, requestVersion);
       } else {
         userPauseIntent = true;
         suppressPauseIntent = true;
@@ -662,6 +764,19 @@ function runCommand(command: VideoCommand): void {
   } catch {
   }
   reportPlayback();
+}
+
+function playVideo(video: HTMLVideoElement, requestVersion: number): void {
+  try {
+    const pending = video.play();
+    void pending.catch(() => {
+      if (requestVersion !== playRequestVersion || !video.paused || video.muted) return;
+      video.muted = true;
+      paneMuted = true;
+      void video.play().catch(() => undefined);
+    });
+  } catch {
+  }
 }
 
 function initialize(): void {
@@ -697,6 +812,7 @@ function initialize(): void {
   const observer = new MutationObserver(scheduleDetection);
   observer.observe(document.documentElement, { childList: true, subtree: true });
   window.addEventListener("resize", scheduleDetection, { passive: true });
+  window.addEventListener("message", receiveFrameVideoMessage);
   attachVideos();
   detectAndApply();
   window.setInterval(() => { attachVideos(); detectAndApply(); }, 800);
