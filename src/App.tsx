@@ -31,6 +31,7 @@ import {
 } from "./shared/types";
 import { resolveEscapeAction, toggleInteractionMode } from "./shared/interaction";
 import { shouldShowPaneNotice } from "./shared/debug-overlays";
+import { httpLoadError, networkLoadError, samePageUrl, type PageLoadError } from "./shared/load-errors";
 
 type WebviewElement = HTMLElement & {
   loadURL: (url: string) => Promise<void>;
@@ -41,6 +42,7 @@ type WebviewElement = HTMLElement & {
   goForward: () => void;
   send: (channel: string, ...args: unknown[]) => void;
   getWebContentsId: () => number;
+  getURL: () => string;
 };
 
 type StableWebviewProps = {
@@ -59,7 +61,6 @@ const StableWebview = memo(function StableWebview({ partition, preload, onRef }:
       partition={partition}
       allowpopups={true}
       allowFullScreen={true}
-      allowfullscreen={true}
       webpreferences="contextIsolation=yes,sandbox=yes,nativeWindowOpen=no"
     />
   );
@@ -231,6 +232,10 @@ function PaneView(props: PaneViewProps): ReactElement {
   const webviewRef = useRef<WebviewElement | null>(null);
   const webviewReadyRef = useRef(false);
   const navigationRequestedRef = useRef(false);
+  const navigationUrlRef = useRef(runtime.url);
+  const requestedUrlRef = useRef(runtime.url);
+  const pageLoadErrorRef = useRef<PageLoadError | null>(null);
+  const [pageLoadError, setPageLoadError] = useState<PageLoadError | null>(null);
   const runtimeRef = useRef(runtime);
   const activeRef = useRef(props.active);
   const onUpdateRef = useRef(props.onUpdate);
@@ -248,6 +253,23 @@ function PaneView(props: PaneViewProps): ReactElement {
   onUpdateRef.current = props.onUpdate;
   onActiveRef.current = props.onActive;
   const isLocalVideo = runtime.mediaSource === "local";
+
+  if (requestedUrlRef.current !== runtime.url) {
+    requestedUrlRef.current = runtime.url;
+    navigationUrlRef.current = runtime.url;
+    pageLoadErrorRef.current = null;
+  }
+
+  const updateLoadError = useCallback((error: PageLoadError | null) => {
+    pageLoadErrorRef.current = error;
+    setPageLoadError(error);
+    if (error) onUpdateRef.current({ playerStatus: error.kind === "crashed" ? "crashed" : "blocked", error: error.message });
+  }, []);
+
+  useEffect(() => {
+    navigationUrlRef.current = runtime.url;
+    updateLoadError(null);
+  }, [runtime.url, runtime.mediaSource, partition, updateLoadError]);
 
   const hideControls = useCallback(() => {
     if (controlsHideTimerRef.current !== null) window.clearTimeout(controlsHideTimerRef.current);
@@ -396,6 +418,14 @@ function PaneView(props: PaneViewProps): ReactElement {
     const onIpcMessage = (event: Event) => {
       const message = event as Event & { channel?: string; args?: unknown[] };
       const currentRuntime = runtimeRef.current;
+      if (webviewRef.current !== webview) return;
+      if (message.channel === "video-state" || message.channel === "player-status" || message.channel === "challenge-state") {
+        try {
+          if (!samePageUrl(webview.getURL(), navigationUrlRef.current)) return;
+        } catch {
+          return;
+        }
+      }
       if (message.channel === "pane-focus") {
         onActiveRef.current();
         return;
@@ -407,6 +437,7 @@ function PaneView(props: PaneViewProps): ReactElement {
         return;
       }
       if (message.channel === "video-state") {
+        if (pageLoadErrorRef.current) return;
         const value = (message.args?.[0] ?? {}) as { userPauseIntent?: unknown };
         const playback = normalizePlayback(value, currentRuntime.playback);
         const patch: Partial<PaneRuntime> = { playback, playing: playback.playing, muted: playback.muted };
@@ -422,8 +453,12 @@ function PaneView(props: PaneViewProps): ReactElement {
       }
       if (message.channel === "challenge-state") {
         const value = (message.args?.[0] ?? {}) as { status?: unknown; url?: unknown; navigationCount?: unknown; message?: unknown };
-        const status = value.status && ["none", "detected", "passed", "looped"].includes(value.status) ? value.status as CloudflareStatus : "none";
+        const status = typeof value.status === "string" && ["none", "detected", "passed", "looped"].includes(value.status) ? value.status as CloudflareStatus : "none";
         const messageText = typeof value.message === "string" ? value.message : undefined;
+        if (pageLoadErrorRef.current) {
+          if (pageLoadErrorRef.current.kind === "http" && (status === "detected" || status === "looped")) updateLoadError(null);
+          else return;
+        }
         void window.desktop.reportChallengeState(currentRuntime.paneId, value);
         if (status === "detected") {
           onUpdateRef.current({ cloudflareStatus: status, playerStatus: "challenge", error: undefined });
@@ -437,6 +472,7 @@ function PaneView(props: PaneViewProps): ReactElement {
         return;
       }
       if (message.channel === "player-status") {
+        if (pageLoadErrorRef.current) return;
         const value = (message.args?.[0] ?? {}) as { status?: PlayerStatus; message?: string };
         const status = value.status && ["idle", "loading", "ready", "unrecognized", "challenge", "blocked", "crashed"].includes(value.status) ? value.status : "loading";
         const error = status === "challenge" ? "请在当前分屏完成 Cloudflare 验证" : value.message || (status === "ready" ? undefined : currentRuntime.error);
@@ -488,19 +524,42 @@ function PaneView(props: PaneViewProps): ReactElement {
         }
       }).catch((error) => onUpdateRef.current({ error: error instanceof Error ? error.message : "分屏网络配置失败" }));
     };
+    const onNavigationStarted = (event: Event) => {
+      const navigation = event as Event & { url?: string; isMainFrame?: boolean; isInPlace?: boolean };
+      if (webviewRef.current !== webview || !navigation.isMainFrame || navigation.isInPlace || !navigation.url || navigation.url === "about:blank") return;
+      navigationUrlRef.current = navigation.url;
+      updateLoadError(null);
+      onUpdateRef.current({ playerStatus: "loading", error: undefined, cloudflareStatus: "none", playback: emptyPlayback(), playing: false });
+    };
+    const onRedirect = (event: Event) => {
+      const navigation = event as Event & { url?: string; isMainFrame?: boolean };
+      if (webviewRef.current === webview && navigation.isMainFrame && navigation.url) navigationUrlRef.current = navigation.url;
+    };
     const onNavigation = (event: Event) => {
-      const navigation = event as Event & { url?: string };
-      if (runtimeRef.current.mediaSource === "network" && typeof navigation.url === "string" && /^https?:\/\//i.test(navigation.url)) setDraftUrl(navigation.url);
+      const navigation = event as Event & { url?: string; httpResponseCode?: number; isMainFrame?: boolean };
+      if (webviewRef.current !== webview || navigation.isMainFrame === false || !navigation.url) return;
+      if (event.type === "did-navigate-in-page") navigationUrlRef.current = navigation.url;
+      if (!samePageUrl(navigation.url, navigationUrlRef.current)) return;
+      if (runtimeRef.current.mediaSource === "network" && /^https?:\/\//i.test(navigation.url)) {
+        setDraftUrl(navigation.url);
+        const error = httpLoadError(navigation.url, navigation.httpResponseCode, navigationUrlRef.current);
+        const challenge = runtimeRef.current.cloudflareStatus === "detected" || runtimeRef.current.cloudflareStatus === "looped";
+        if (error && !challenge) updateLoadError(error);
+      }
       window.setTimeout(syncNavigationState, 0);
     };
     const onFailedLoad = (event: Event) => {
-      const failure = event as Event & { errorDescription?: string; errorCode?: number; isMainFrame?: boolean };
-      if (failure.isMainFrame === false || failure.errorCode === -3) return;
+      if (webviewRef.current !== webview) return;
+      const failure = event as Event & { errorDescription?: string; errorCode?: number; isMainFrame?: boolean; validatedURL?: string };
+      const error = networkLoadError(failure, navigationUrlRef.current);
+      if (!error) return;
       const localFailure = runtimeRef.current.mediaSource === "local";
       if (localFailure && runtimeRef.current.playback.hasVideo) return;
-      onUpdateRef.current({ playerStatus: "blocked", error: localFailure ? "本地视频无法加载，请确认文件未被删除、可访问且编码受支持" : failure.errorDescription || "页面加载失败" });
+      updateLoadError(localFailure ? { ...error, message: "本地视频无法加载，请确认文件未被删除、可访问且编码受支持" } : error);
     };
-    const onProcessGone = () => onUpdateRef.current({ playerStatus: "crashed", error: "网页进程已崩溃，请重新加载" });
+    const onProcessGone = () => {
+      if (webviewRef.current === webview) updateLoadError({ kind: "crashed", url: navigationUrlRef.current, message: "网页进程已崩溃，请重新加载" });
+    };
     const onNewWindow = (event: Event) => {
       const popup = event as Event & { url?: string; preventDefault?: () => void };
       popup.preventDefault?.();
@@ -530,7 +589,9 @@ function PaneView(props: PaneViewProps): ReactElement {
     };
     webview.addEventListener("ipc-message", onIpcMessage);
     webview.addEventListener("dom-ready", onDomReady);
-    webview.addEventListener("did-navigate", onNavigation);
+    webview.addEventListener("did-start-navigation", onNavigationStarted);
+    webview.addEventListener("did-redirect-navigation", onRedirect);
+    webview.addEventListener("did-frame-navigate", onNavigation);
     webview.addEventListener("did-navigate-in-page", onNavigation);
     webview.addEventListener("did-fail-load", onFailedLoad);
     webview.addEventListener("render-process-gone", onProcessGone);
@@ -541,7 +602,9 @@ function PaneView(props: PaneViewProps): ReactElement {
     return () => {
       webview.removeEventListener("ipc-message", onIpcMessage);
       webview.removeEventListener("dom-ready", onDomReady);
-      webview.removeEventListener("did-navigate", onNavigation);
+      webview.removeEventListener("did-start-navigation", onNavigationStarted);
+      webview.removeEventListener("did-redirect-navigation", onRedirect);
+      webview.removeEventListener("did-frame-navigate", onNavigation);
       webview.removeEventListener("did-navigate-in-page", onNavigation);
       webview.removeEventListener("did-fail-load", onFailedLoad);
       webview.removeEventListener("render-process-gone", onProcessGone);
@@ -550,7 +613,7 @@ function PaneView(props: PaneViewProps): ReactElement {
       webview.removeEventListener("mousemove", onWebviewMouseMove);
       webview.removeEventListener("mouseleave", onWebviewMouseLeave);
     };
-  }, [runtime.paneId, runtime.url, partition, props.guestPreloadUrl, props.interactionMode, hideControls, revealControls, syncNavigationState]);
+  }, [runtime.paneId, runtime.url, partition, props.guestPreloadUrl, props.interactionMode, hideControls, revealControls, syncNavigationState, updateLoadError]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -661,12 +724,23 @@ function PaneView(props: PaneViewProps): ReactElement {
     if (host) await window.desktop.setAdblock(runtime.paneId, host, enabled);
     void window.desktop.setChallengeMode(runtime.paneId, false);
     props.onUpdate({ adblockEnabled: enabled, userPauseIntent: false, playerStatus: "loading", cloudflareStatus: "none", error: undefined });
+    updateLoadError(null);
     webviewRef.current?.reload();
   };
   const reloadPane = () => {
+    const failedUrl = pageLoadErrorRef.current?.url;
+    updateLoadError(null);
     if (!isLocalVideo) void window.desktop.setChallengeMode(runtime.paneId, false);
     props.onUpdate({ userPauseIntent: false, playerStatus: "loading", cloudflareStatus: "none", error: undefined });
-    webviewRef.current?.reload();
+    if (failedUrl && !isLocalVideo) void webviewRef.current?.loadURL(failedUrl).catch(() => undefined);
+    else webviewRef.current?.reload();
+  };
+  const openCurrentPageInChrome = () => {
+    const url = navigationUrlRef.current;
+    if (!/^https?:\/\//i.test(url)) return;
+    void window.desktop.openInChrome(url).then((opened) => {
+      if (!opened) props.onUpdate({ error: "未找到 Google Chrome" });
+    });
   };
   const toggleSessionMode = () => {
     if (isLocalVideo) return;
@@ -709,7 +783,8 @@ function PaneView(props: PaneViewProps): ReactElement {
   const decoderIssue = runtime.playback.hasVideo && runtime.playback.readyState >= 2 && (runtime.playback.videoWidth === 0 || runtime.playback.videoHeight === 0);
   const renderIssue = runtime.focusModeEnabled && runtime.playerStatus === "ready" && runtime.playback.hasVideo && runtime.playback.videoWidth > 0 && runtime.playback.videoHeight > 0 && (runtime.playback.playerWidth <= 2 || runtime.playback.playerHeight <= 2);
   const hasPaneNotice = Boolean(runtime.error || runtime.playerStatus === "unrecognized" || runtime.playerStatus === "challenge" || runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped");
-  const showPaneNotice = shouldShowPaneNotice({ debugOverlays: props.debugOverlays, interactionMode: props.interactionMode, hasContent: Boolean(runtime.url), hasNotice: hasPaneNotice });
+  const visibleLoadError = pageLoadErrorRef.current === pageLoadError ? pageLoadError : null;
+  const showPaneNotice = Boolean(visibleLoadError) || shouldShowPaneNotice({ debugOverlays: props.debugOverlays, interactionMode: props.interactionMode, hasContent: Boolean(runtime.url), hasNotice: hasPaneNotice });
 
   return (
     <div className={`video-pane ${props.active ? "active" : ""} ${props.interactionMode === "app" ? "app-input-mode" : "web-input-mode"}`} onPointerDown={props.onActive} onPointerMove={handleMouseMove} onMouseLeave={() => runtime.url && hideControls()}>
@@ -767,7 +842,7 @@ function PaneView(props: PaneViewProps): ReactElement {
               <option value="custom">分屏自定义 HTTP</option>
             </select>
             }
-            {!isLocalVideo && runtime.playerStatus === "blocked" && <button className="icon-button warning" onClick={props.onOpenChrome}>用 Chrome 打开</button>}
+            {!isLocalVideo && runtime.playerStatus === "blocked" && <button className="icon-button warning" onClick={openCurrentPageInChrome}>用 Chrome 打开</button>}
             <button className="icon-button" onClick={hideControls}>收起</button>
             <button className="icon-button danger" onClick={props.onRemove}>关闭</button>
           </div>
@@ -791,9 +866,10 @@ function PaneView(props: PaneViewProps): ReactElement {
         </div>
       )}
       {showPaneNotice && (
-        <div className="pane-notice">
-          <span>{runtime.cloudflareStatus === "detected" ? "检测到 Cloudflare 验证，已放行验证资源，请在当前页面完成验证。" : runtime.cloudflareStatus === "looped" ? "验证仍在循环，应用已停止自动刷新。" : runtime.error || (runtime.playerStatus === "challenge" ? "请在当前分屏完成 Cloudflare 验证" : "无法识别播放器，已保留网页兼容画面")}</span>
-          {!isLocalVideo && runtime.playerStatus === "blocked" && <button className="icon-button warning" onClick={props.onOpenChrome}>用 Chrome 打开</button>}
+        <div className="pane-notice" role={visibleLoadError ? "alert" : "status"} onPointerDown={(event) => event.stopPropagation()}>
+          <span>{visibleLoadError?.message || (runtime.cloudflareStatus === "detected" ? "检测到 Cloudflare 验证，已放行验证资源，请在当前页面完成验证。" : runtime.cloudflareStatus === "looped" ? "验证仍在循环，应用已停止自动刷新。" : runtime.error || (runtime.playerStatus === "challenge" ? "请在当前分屏完成 Cloudflare 验证" : "无法识别播放器，已保留网页兼容画面"))}</span>
+          {visibleLoadError && <button className="icon-button" onClick={reloadPane}>重试</button>}
+          {!isLocalVideo && (visibleLoadError || runtime.playerStatus === "blocked") && <button className="icon-button warning" onClick={openCurrentPageInChrome}>用 Chrome 打开</button>}
         </div>
       )}
       {runtime.url && props.interactionMode === "app" && !showControls && <button className="pane-badge" onPointerDown={(event) => event.stopPropagation()} onClick={revealControls}>{runtime.error ? "播放受限" : runtime.playerStatus === "unrecognized" ? "播放器未识别" : runtime.playing ? "播放中" : "已暂停"} · 控制</button>}
@@ -1013,14 +1089,6 @@ export default function App(): ReactElement {
       } else if (action === "exit-app-fullscreen") {
         void window.desktop.setFullscreen(false).then(setFullscreen);
       }
-    });
-    window.desktop.onPaneBlocked((paneId, statusCode, challengeResource) => {
-      setRuntimes((current) => {
-        const runtime = current[paneId];
-        if (!runtime) return current;
-        const challenge = challengeResource || (statusCode === 412 && (runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped"));
-        return { ...current, [paneId]: { ...runtime, playerStatus: challenge ? "challenge" : "blocked", cloudflareStatus: challenge ? "detected" : runtime.cloudflareStatus, error: challenge ? "站点要求完成 Cloudflare 验证，请在当前分屏完成验证" : `站点拒绝了内嵌请求（HTTP ${statusCode}），可点击“用 Chrome 打开”在真实浏览器中播放` } };
-      });
     });
     window.desktop.onProxyStatus((value) => {
       if (!value || typeof value !== "object") return;

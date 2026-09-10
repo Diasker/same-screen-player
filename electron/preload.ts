@@ -5,7 +5,6 @@ let htmlFullscreenListener: ((event: Electron.IpcRendererEvent, paneId: unknown,
 let toggleInteractionListener: (() => void) | null = null;
 let toggleAppFullscreenListener: (() => void) | null = null;
 let escapeListener: (() => void) | null = null;
-let paneBlockedListener: ((event: Electron.IpcRendererEvent, paneId: unknown, statusCode: unknown, challenge: unknown) => void) | null = null;
 let chromeSessionErrorListener: ((event: Electron.IpcRendererEvent, message: unknown) => void) | null = null;
 let proxyStatusListener: ((event: Electron.IpcRendererEvent, status: unknown) => void) | null = null;
 
@@ -40,13 +39,6 @@ contextBridge.exposeInMainWorld("desktop", {
     if (escapeListener) ipcRenderer.removeListener("window:escape", escapeListener);
     escapeListener = () => callback();
     ipcRenderer.on("window:escape", escapeListener);
-  },
-  onPaneBlocked: (callback: (paneId: string, statusCode: number, challenge: boolean) => void): void => {
-    if (paneBlockedListener) ipcRenderer.removeListener("pane:blocked", paneBlockedListener);
-    paneBlockedListener = (_event, paneId: unknown, statusCode: unknown, challenge: unknown) => {
-      if (typeof paneId === "string" && typeof statusCode === "number") callback(paneId, statusCode, Boolean(challenge));
-    };
-    ipcRenderer.on("pane:blocked", paneBlockedListener);
   },
   loadLayout: (): Promise<unknown> => ipcRenderer.invoke("layout:load"),
   saveLayout: (layout: unknown): Promise<boolean> => ipcRenderer.invoke("layout:save", layout),

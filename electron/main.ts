@@ -34,6 +34,8 @@ import { chromeUserAgent, installFingerprintForSession, mainWorldFingerprintScri
 import { helperPath, WindowsWindowHelper } from "./windows-helper";
 import { frameVideoBridgeScript } from "./frame-video-bridge";
 import { debugOverlaysEnabled } from "../src/shared/debug-overlays";
+import { isKnownAdRequest } from "./ad-navigation";
+import { loadLocalVideoDirectory, saveLocalVideoPath } from "./local-video-preferences";
 
 app.userAgentFallback = chromeUserAgent();
 const runtimeFlags = {
@@ -57,6 +59,19 @@ type FrameFinishListener = (event: Electron.Event, isMainFrame: boolean, framePr
 const guestBindings = new Map<number, { paneId: string; contents: Electron.WebContents; onBeforeInput: BeforeInputListener; onEnterFullscreen: () => void; onLeaveFullscreen: () => void; onWillNavigate: NavigationListener; onNavigate: NavigationListener; onNavigateInPage: NavigationListener; onFrameCreated: FrameCreatedListener; onFrameFinish: FrameFinishListener; onDestroyed: () => void }>();
 const disabledAdblockRules = new Set<string>();
 const disabledAdblockPanes = new Set<string>();
+const compatibilityResourceTypes = new Set([
+  "mainframe",
+  "subframe",
+  "media",
+  "object",
+  "script",
+  "stylesheet",
+  "font",
+  "manifest",
+  "xhr",
+  "fetch",
+  "websocket",
+]);
 const challengeNavigation = new Map<string, ChallengeNavigationState>();
 const challengeModePanes = new Set<string>();
 const installedBlockingSessions = new WeakSet<Electron.Session>();
@@ -111,8 +126,11 @@ async function isAuthorizedLocalVideoUrl(value: unknown): Promise<boolean> {
 
 async function selectLocalVideo(): Promise<{ ok: true; url: string; fileName: string } | { ok: false; canceled: boolean; message?: string }> {
   try {
+    const preferenceFile = path.join(app.getPath("userData"), "last-local-video.json");
+    const defaultPath = await loadLocalVideoDirectory(preferenceFile);
     const result = await dialog.showOpenDialog({
       title: "选择本地视频",
+      ...(defaultPath ? { defaultPath } : {}),
       properties: ["openFile"],
       filters: [{ name: "视频文件", extensions: ["mp4", "m4v", "webm", "mov", "ogv"] }],
     });
@@ -124,6 +142,7 @@ async function selectLocalVideo(): Promise<{ ok: true; url: string; fileName: st
     }
     const url = pathToFileURL(filePath).toString();
     authorizedLocalVideoUrls.add(url);
+    await saveLocalVideoPath(preferenceFile, filePath).catch(() => undefined);
     return { ok: true, url, fileName: path.basename(filePath) };
   } catch {
     return { ok: false, canceled: false, message: "无法读取所选本地视频，请确认文件仍存在且有访问权限" };
@@ -429,6 +448,10 @@ function bindGuest(paneId: string, webContentsId: number): void {
     sendWindowMessage("window:html-fullscreen-change", paneId, false);
   };
   const onWillNavigate: NavigationListener = (event, url) => {
+    if (isKnownAdRequest(url) && !disabledAdblockPanes.has(paneId)) {
+      event.preventDefault();
+      return;
+    }
     if (isSafeUrl(url)) return;
     if (isFileUrl(url) && authorizedLocalVideoUrls.has(url)) return;
     event.preventDefault();
@@ -861,6 +884,14 @@ function installAdblockForSession(targetSession: Electron.Session): void {
       callback({});
       return;
     }
+    if (!disabledAdblockPanes.has(paneId ?? "") && isKnownAdRequest(details.url)) {
+      callback({ cancel: true });
+      return;
+    }
+    if (compatibilityResourceTypes.has(String(details.resourceType).toLowerCase())) {
+      callback({});
+      return;
+    }
     if (isAuthenticationUrl(details.url)) {
       callback({});
       return;
@@ -878,15 +909,12 @@ function installSessionDiagnostics(targetSession: Electron.Session): void {
   installedSessionDiagnostics.add(targetSession);
   targetSession.webRequest.onCompleted({ urls: ["<all_urls>"] }, (details) => {
     const resourceType = String(details.resourceType);
-    const pageLikeRequest = resourceType === "mainFrame" || resourceType === "subFrame" || resourceType === "media" || resourceType === "manifest";
     const paneId = typeof details.webContentsId === "number" ? paneWebContents.get(details.webContentsId) : undefined;
     const challengeResource = isCloudflareChallengeRequest(details.url, details.resourceType);
     const trackedChallengePage = Boolean(paneId && challengeModePanes.has(paneId) && resourceType === "mainFrame");
     if (paneId && (challengeResource || trackedChallengePage)) {
       recordCloudflareDiagnostic(paneId, details.url, "resource-completed", challengeNavigation.get(paneId)?.navigationCount ?? 0, details.statusCode);
     }
-    if (details.statusCode !== 412 && (!pageLikeRequest || ![401, 403, 451].includes(details.statusCode))) return;
-    if (paneId) mainWindow?.webContents.send("pane:blocked", paneId, details.statusCode, challengeResource || trackedChallengePage);
   });
 }
 

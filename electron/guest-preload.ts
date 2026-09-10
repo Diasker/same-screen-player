@@ -58,6 +58,7 @@ let lastStatusMessage = "";
 let lastSnapshot: PlaybackSnapshot | null = null;
 let suppressPauseIntent = false;
 let playRequestVersion = 0;
+let pauseCommandLocked = false;
 let lastUserInteractionAt = 0;
 let controlsVisible = false;
 let targetMissingSince = 0;
@@ -71,6 +72,8 @@ const wasPlaying = new WeakMap<HTMLVideoElement, boolean>();
 const remoteFrameStates = new Map<HTMLIFrameElement, RemoteFrameState>();
 const remoteFrameMuteSynced = new WeakSet<HTMLIFrameElement>();
 const FRAME_VIDEO_SOURCE = "same-screen-frame-video";
+const nativeMediaPlay = HTMLMediaElement.prototype.play;
+const nativeMediaPause = HTMLMediaElement.prototype.pause;
 
 function sendChallengeState(status: CloudflareStatus, url?: string, navigationCount?: number, message?: string): void {
   const nextUrl = url ?? "";
@@ -462,8 +465,13 @@ function frameForMessage(source: MessageEventSource | null): HTMLIFrameElement |
 }
 
 function receiveFrameVideoMessage(event: MessageEvent): void {
-  const value = event.data as { source?: unknown; kind?: unknown; state?: unknown } | null;
-  if (!value || value.source !== FRAME_VIDEO_SOURCE || value.kind !== "state") return;
+  const value = event.data as { source?: unknown; kind?: unknown; state?: unknown; result?: unknown } | null;
+  if (!value || value.source !== FRAME_VIDEO_SOURCE) return;
+  if (value.kind === "command-result") {
+    ipcRenderer.sendToHost("focus-diagnostic", { kind: "frame-command", result: value.result });
+    return;
+  }
+  if (value.kind !== "state") return;
   const frame = frameForMessage(event.source);
   if (!frame) return;
   const state = normalizeRemoteFrameState(value.state);
@@ -568,6 +576,14 @@ function attachVideo(video: HTMLVideoElement): void {
   boundVideos.add(video);
   video.muted = paneMuted;
   video.addEventListener("play", () => {
+    if (pauseCommandLocked && Date.now() - lastUserInteractionAt >= 900) {
+      try {
+        nativeMediaPause.call(video);
+      } catch {
+      }
+      reportPlayback();
+      return;
+    }
     wasPlaying.set(video, true);
     if (Date.now() - lastUserInteractionAt < 900) userPauseIntent = false;
     reportPlayback();
@@ -714,32 +730,37 @@ function runCommand(command: VideoCommand): void {
   const target = mediaTarget();
   if (!target) return;
   if (target.kind === "frame") {
-    if (command.type === "pause") userPauseIntent = true;
-    else if (command.type === "play") userPauseIntent = false;
-    else if (command.type === "toggle") userPauseIntent = target.state.playing;
-    else if (command.type === "toggleMuted") sendFrameVideoCommand(target.frame, { type: "setMuted", value: !target.state.muted });
-    else sendFrameVideoCommand(target.frame, command);
+    let frameCommand = command;
+    if (command.type === "toggle") frameCommand = { type: target.state.playing ? "pause" : "play" };
+    else if (command.type === "toggleMuted") frameCommand = { type: "setMuted", value: !target.state.muted };
+    if (frameCommand.type === "pause") userPauseIntent = true;
+    else if (frameCommand.type === "play") userPauseIntent = false;
+    sendFrameVideoCommand(target.frame, frameCommand);
     reportPlayback();
     return;
   }
   const video = target.video;
   try {
     if (command.type === "play") {
+      pauseCommandLocked = false;
       userPauseIntent = false;
       playVideo(video, requestVersion);
     } else if (command.type === "pause") {
+      pauseCommandLocked = true;
       userPauseIntent = true;
       suppressPauseIntent = true;
-      video.pause();
+      pauseVideo(video, requestVersion);
       suppressPauseIntent = false;
     } else if (command.type === "toggle") {
       if (video.paused || video.ended) {
+        pauseCommandLocked = false;
         userPauseIntent = false;
         playVideo(video, requestVersion);
       } else {
+        pauseCommandLocked = true;
         userPauseIntent = true;
         suppressPauseIntent = true;
-        video.pause();
+        pauseVideo(video, requestVersion);
         suppressPauseIntent = false;
       }
     } else if (command.type === "seek") {
@@ -768,15 +789,32 @@ function runCommand(command: VideoCommand): void {
 
 function playVideo(video: HTMLVideoElement, requestVersion: number): void {
   try {
-    const pending = video.play();
+    const pending = nativeMediaPlay.call(video);
     void pending.catch(() => {
-      if (requestVersion !== playRequestVersion || !video.paused || video.muted) return;
+      if (requestVersion !== playRequestVersion || !video.paused) return;
       video.muted = true;
       paneMuted = true;
-      void video.play().catch(() => undefined);
+      void nativeMediaPlay.call(video).catch(() => undefined);
     });
   } catch {
   }
+}
+
+function pauseVideo(video: HTMLVideoElement, requestVersion: number): void {
+  try {
+    nativeMediaPause.call(video);
+  } catch {
+  }
+  [80, 220, 500].forEach((delay) => {
+    window.setTimeout(() => {
+      if (requestVersion !== playRequestVersion || video.ended || video.paused) return;
+      try {
+        nativeMediaPause.call(video);
+      } catch {
+      }
+      reportPlayback();
+    }, delay);
+  });
 }
 
 function initialize(): void {
@@ -785,6 +823,7 @@ function initialize(): void {
   sendStatus("loading");
   document.addEventListener("pointerdown", () => {
     markUserInteraction();
+    if (pauseCommandLocked) pauseCommandLocked = false;
     ipcRenderer.sendToHost("pane-focus");
   }, true);
   document.addEventListener("mousemove", (event) => reportControlsVisibility(event.clientY >= window.innerHeight - 112), true);

@@ -29,6 +29,10 @@ Enter an `http://` or `https://` address in an empty pane and click **Play**, or
 
 Local video selection accepts MP4, M4V, WebM, MOV, and OGV containers; actual codec support depends on Electron's embedded Chromium. File paths are never saved in the layout, so local videos do not reopen after restart.
 
+The last successfully selected video's absolute path is stored in `last-local-video.json` in the application user-data directory, shared across panes. The next file picker opens its containing directory. If the file has moved, been deleted, or is inaccessible, the system default directory is used. Canceling selection preserves the previous preference.
+
+Main-page load failures show a translated explanation and diagnostic code in the affected pane, with Retry and Open in Chrome actions. These notices remain visible in production and both interaction modes. Subframe and other resource failures do not mark the whole page as failed; Cloudflare verification remains available in the original page.
+
 When a local video is active, use the webpage address field in the App-mode control bar to switch the same pane back to a network page.
 
 ### Interaction modes
@@ -72,6 +76,8 @@ npm run build
 npm test
 npm run dist
 ```
+
+After building, run `node scripts/verify-load-errors.cjs` to check pane errors, retries, stale-navigation isolation, local playback, and directory persistence across restarts. The check uses a temporary profile and a stubbed file picker, leaving your normal settings untouched.
 
 `npm run dev` starts Vite and Electron. After changing the main process or guest preload, run `npm run build` and fully restart the development process; a page refresh or HMR alone does not reload those scripts.
 

@@ -117,6 +117,7 @@ npm run dist
 ## Testing notes
 
 - `npm test` runs Vitest unit tests for layout swapping, proxy conversion and validation, interaction state, fingerprinting, Cloudflare, and CDP helpers.
+- `npm run test:frame-controls` builds the preloads and runs an isolated Electron webview test with locally generated video. It checks play, pause, and toggle commands in cross-origin frames, nested frames, and direct video pages, including the actual media clock and host playback state.
 - When changing the layout tree, add pure-function tests to `src/shared/layout.test.ts` first.
 - When changing proxy behavior, update `src/shared/proxy.test.ts` and avoid depending on a live proxy server in tests.
 - After changing a guest preload, run `npm run build` and verify that a new bundle is generated in `dist-electron`.

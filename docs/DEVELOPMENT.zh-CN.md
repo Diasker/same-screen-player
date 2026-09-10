@@ -117,6 +117,7 @@ npm run dist
 ## 测试说明
 
 - `npm test` 运行 Vitest 单元测试，覆盖布局交换、代理转换与校验、交互状态、指纹、Cloudflare 和 CDP 辅助逻辑。
+- `npm run test:frame-controls` 构建预加载脚本，并使用本地生成的视频在独立 Electron 网页视图中测试跨域框架、多层嵌套框架和直接视频页面的播放、暂停及切换命令，同时检查视频实际时间与应用收到的播放状态。
 - 修改布局树时，优先在 `src/shared/layout.test.ts` 添加纯函数测试。
 - 修改代理协议时，同时更新 `src/shared/proxy.test.ts`，不要在测试中依赖真实代理服务器。
 - 修改访客脚本后运行 `npm run build`，确认 `dist-electron` 中生成新的 bundle。

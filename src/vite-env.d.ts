@@ -10,7 +10,6 @@ interface DesktopApi {
   onToggleInteractionMode: (callback: () => void) => void;
   onToggleAppFullscreen: (callback: () => void) => void;
   onEscape: (callback: () => void) => void;
-  onPaneBlocked: (callback: (paneId: string, statusCode: number, challenge: boolean) => void) => void;
   loadLayout: () => Promise<unknown>;
   saveLayout: (layout: unknown) => Promise<boolean>;
   selectLocalVideo: () => Promise<unknown>;

@@ -3,10 +3,15 @@ export function frameVideoBridgeScript(): string {
     if (window.top === window || window.__sameScreenFrameVideoBridge) return;
     window.__sameScreenFrameVideoBridge = true;
     const source = "same-screen-frame-video";
+    const nativePlay = HTMLMediaElement.prototype.play;
+    const nativePause = HTMLMediaElement.prototype.pause;
     const boundVideos = new WeakSet();
+    const childStates = new Map();
     let lastState = "";
     let lastSentAt = 0;
     let commandVersion = 0;
+    let pauseLocked = false;
+    let lastFrameInteractionAt = 0;
     let lastCleanupAt = 0;
 
     function isVisible(video) {
@@ -97,13 +102,17 @@ export function frameVideoBridgeScript(): string {
     function attach(video) {
       if (boundVideos.has(video)) return;
       boundVideos.add(video);
-      ["durationchange", "progress", "timeupdate", "volumechange", "ratechange", "loadedmetadata", "canplay", "play", "pause", "ended"].forEach((eventName) => video.addEventListener(eventName, () => publish(true)));
+      ["durationchange", "progress", "timeupdate", "volumechange", "ratechange", "loadedmetadata", "canplay", "pause", "ended"].forEach((eventName) => video.addEventListener(eventName, () => publish(true)));
+      video.addEventListener("play", () => {
+        if (pauseLocked && Date.now() - lastFrameInteractionAt >= 900) pauseVideo(video, commandVersion);
+        publish(true);
+      });
     }
 
     function isAdHint(element, rect, videoRect) {
       const identity = [element.id || "", typeof element.className === "string" ? element.className : "", element.getAttribute("src") || "", element.getAttribute("href") || "", element.getAttribute("aria-label") || "", element.getAttribute("title") || ""].join(" ");
       if (/\b(?:ad|ads|advert|advertisement|banner|sponsor|promo|promotion|popunder|popup|commercial)\b|广告|赞助|推广|优惠|折扣|弹窗/i.test(identity)) return true;
-      if (element.tagName === "IFRAME" && !element.hasAttribute("allowfullscreen") && rect.width * rect.height <= videoRect.width * videoRect.height * 0.6) return true;
+      if (/content-sync\.xyz|tsyndicate\.com|wishapptrack\.com|mengmei8\.com|twinrdengine\.com|marzaent\.com|trafficType=popunder/i.test(identity)) return true;
       const text = (element.textContent || "").trim().slice(0, 500);
       const interactive = /^(?:A|IFRAME|IMG|BUTTON)$/.test(element.tagName) || Boolean(element.querySelector("a, iframe, img, button"));
       return /discount|special offer|limited offer|click here|广告|赞助|推广|优惠|折扣|免费|casino|singtel/i.test(text)
@@ -146,67 +155,134 @@ export function frameVideoBridgeScript(): string {
       });
     }
 
+    function childFrames() {
+      try { return Array.from(document.querySelectorAll("iframe")); } catch { return []; }
+    }
+
     function forwardCommand(command) {
       if (!command || typeof command !== "object") return;
-      let frames = [];
-      try { frames = Array.from(document.querySelectorAll("iframe")); } catch { return; }
-      frames.forEach((frame) => {
+      childFrames().forEach((frame) => {
         try { frame.contentWindow?.postMessage({ source, command }, "*"); } catch { }
       });
     }
 
     function playVideo(video, version) {
       try {
-        const pending = video.play();
+        const pending = nativePlay.call(video);
         pending?.catch(() => {
-          if (version !== commandVersion || !video.paused || video.muted) return;
+          if (version !== commandVersion || !video.paused) return;
           video.muted = true;
-          void video.play().catch(() => undefined);
+          void nativePlay.call(video).catch(() => undefined);
         });
       } catch {
       }
     }
 
+    function pauseVideo(video, version) {
+      try { nativePause.call(video); } catch { }
+      [80, 220, 500].forEach((delay) => {
+        window.setTimeout(() => {
+          if (version !== commandVersion || video.ended || video.paused) return;
+          try { nativePause.call(video); } catch { }
+          publish(true);
+        }, delay);
+      });
+    }
+
+    function recentChildPlaying() {
+      const now = Date.now();
+      return childFrames().some((frame) => {
+        const state = childStates.get(frame);
+        return Boolean(state && state.hasVideo && now - state.receivedAt < 3000 && state.playing);
+      });
+    }
+
+    function reportCommandResult(command, version) {
+      const report = () => {
+        const videos = collectVideos(document);
+        window.parent.postMessage({
+          source,
+          kind: "command-result",
+          result: {
+            command: command.type,
+            version,
+            host: window.location.hostname,
+            videoCount: videos.length,
+            playingCount: videos.filter((candidate) => !candidate.paused && !candidate.ended).length,
+            pauseLocked,
+          },
+        }, "*");
+      };
+      window.setTimeout(report, 120);
+      window.setTimeout(report, 700);
+    }
+
     function scan() {
-      collectVideos(document).forEach(attach);
+      const videos = collectVideos(document);
+      videos.forEach(attach);
+      if (pauseLocked) videos.forEach((candidate) => {
+        if (!candidate.paused && !candidate.ended) {
+          try { nativePause.call(candidate); } catch { }
+        }
+      });
       cleanupAdOverlays();
       publish(false);
     }
 
     function runCommand(command) {
-      const video = pickVideo();
       if (!command || typeof command !== "object") return;
       commandVersion += 1;
-      if (!video) {
-        forwardCommand(command);
-        return;
-      }
+      const version = commandVersion;
+      const videos = collectVideos(document);
+      const video = pickVideo();
+      const localPlaying = videos.some((candidate) => !candidate.paused && !candidate.ended);
       try {
-        if (command.type === "play") playVideo(video, commandVersion);
-        else if (command.type === "pause") video.pause();
+        if (command.type === "play") {
+          pauseLocked = false;
+          if (video) playVideo(video, version);
+          forwardCommand(command);
+        }
+        else if (command.type === "pause") {
+          pauseLocked = true;
+          videos.forEach((candidate) => pauseVideo(candidate, version));
+          forwardCommand(command);
+        }
         else if (command.type === "toggle") {
-          if (video.paused || video.ended) playVideo(video, commandVersion);
-          else video.pause();
-        } else if (command.type === "seek" && Number.isFinite(command.value)) video.currentTime = Math.max(0, command.value);
-        else if (command.type === "setVolume" && Number.isFinite(command.value)) video.volume = Math.min(1, Math.max(0, command.value));
-        else if (command.type === "toggleMuted") video.muted = !video.muted;
-        else if (command.type === "setMuted" && typeof command.value === "boolean") video.muted = command.value;
-        else if (command.type === "setRate" && Number.isFinite(command.value)) video.playbackRate = Math.min(4, Math.max(0.25, command.value));
+          const shouldPause = recentChildPlaying() || (!childFrames().some((frame) => childStates.has(frame)) && localPlaying);
+          const action = shouldPause ? { type: "pause" } : { type: "play" };
+          pauseLocked = shouldPause;
+          if (shouldPause) videos.forEach((candidate) => pauseVideo(candidate, version));
+          else if (video) playVideo(video, version);
+          forwardCommand(action);
+        } else {
+          if (command.type === "seek" && Number.isFinite(command.value) && video) video.currentTime = Math.max(0, command.value);
+          else if (command.type === "setVolume" && Number.isFinite(command.value) && video) video.volume = Math.min(1, Math.max(0, command.value));
+          else if (command.type === "toggleMuted" && video) video.muted = !video.muted;
+          else if (command.type === "setMuted" && typeof command.value === "boolean" && video) video.muted = command.value;
+          else if (command.type === "setRate" && Number.isFinite(command.value) && video) video.playbackRate = Math.min(4, Math.max(0.25, command.value));
+          forwardCommand(command);
+        }
       } catch {
       }
       publish(true);
+      reportCommandResult(command, version);
     }
 
     window.addEventListener("message", (event) => {
       const value = event.data;
       if (!value || value.source !== source) return;
       if (event.source !== window.parent) {
+        if (value.kind === "state") {
+          const frame = childFrames().find((candidate) => candidate.contentWindow === event.source);
+          if (frame && value.state && typeof value.state === "object") childStates.set(frame, { ...value.state, receivedAt: Date.now() });
+        }
         window.parent.postMessage(value, "*");
         return;
       }
       runCommand(value.command);
     });
     function start() {
+      window.addEventListener("pointerdown", () => { lastFrameInteractionAt = Date.now(); if (pauseLocked) pauseLocked = false; }, true);
       scan();
       const observer = new MutationObserver(scan);
       observer.observe(document.documentElement, { childList: true, subtree: true });
