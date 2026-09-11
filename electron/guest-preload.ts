@@ -296,6 +296,42 @@ function hasVisibleDialog(): boolean {
   });
 }
 
+function isPlayerControlElement(element: HTMLElement): boolean {
+  const identity = [element.id || "", typeof element.className === "string" ? element.className : "", element.getAttribute("aria-label") || "", element.getAttribute("title") || ""].join(" ");
+  return /(?:^|[-_\s])(?:control|controls|progress|volume|fullscreen|settings?|seek|timeline|tooltip|play|pause)(?:$|[-_\s])/i.test(identity);
+}
+
+function isHighConfidenceAdOverlay(element: HTMLElement, videoRect: DOMRect): boolean {
+  if (element === document.documentElement || element === document.body || element.contains(focusTarget?.video ?? null)) return false;
+  if (isPlayerControlElement(element)) return false;
+  const style = window.getComputedStyle(element);
+  if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+  if (style.position !== "absolute" && style.position !== "fixed" && style.position !== "sticky") return false;
+  const rect = element.getBoundingClientRect();
+  if (rect.width <= 2 || rect.height <= 2 || rect.width * rect.height > videoRect.width * videoRect.height * 0.7) return false;
+  if (rect.right <= videoRect.left || rect.left >= videoRect.right || rect.bottom <= videoRect.top || rect.top >= videoRect.bottom) return false;
+  const identity = [element.id || "", typeof element.className === "string" ? element.className : "", element.getAttribute("src") || "", element.getAttribute("href") || "", element.getAttribute("aria-label") || "", element.getAttribute("title") || ""].join(" ");
+  const text = (element.textContent || "").trim().slice(0, 800);
+  const knownAd = /content-sync\.xyz|tsyndicate\.com|wishapptrack\.com|mengmei8\.com|twinrdengine\.com|marzaent\.com|trafficType=popunder/i.test(identity);
+  const adultAd = /\b(?:porn|porno|adult|erotic|sex|18\s*\+|live\s*cams?)\b|порно|эротик|для взрослых|广告|赞助|推广|优惠|折扣|弹窗/i.test(`${identity} ${text}`);
+  if (!knownAd && !adultAd) return false;
+  const hasCloseControl = Boolean(element.querySelector("button, [role='button'], [aria-label*='close' i], [title*='close' i], [aria-label*='关闭'], [title*='关闭']"));
+  const hasImageOrLink = Boolean(element.querySelector("img, picture, svg, a"));
+  return knownAd || (adultAd && hasImageOrLink && hasCloseControl);
+}
+
+function cleanupAdOverlays(): void {
+  const target = detectPlayer()?.video;
+  if (!target) return;
+  const videoRect = target.getBoundingClientRect();
+  if (videoRect.width <= 2 || videoRect.height <= 2) return;
+  let candidates: HTMLElement[] = [];
+  try { candidates = Array.from(document.querySelectorAll<HTMLElement>("[id], [class], [src], [href], [role='dialog'], iframe")); } catch { return; }
+  candidates.forEach((element) => {
+    if (isHighConfidenceAdOverlay(element, videoRect)) element.style.setProperty("display", "none", "important");
+  });
+}
+
 function isNativeFullscreen(): boolean {
   return Boolean(document.fullscreenElement || (document as Document & { webkitFullscreenElement?: Element | null }).webkitFullscreenElement);
 }
@@ -651,6 +687,7 @@ function detectAndApply(): void {
     cloudflareNavigation = emptyChallengeNavigation();
   }
   const target = detectPlayer();
+  cleanupAdOverlays();
   const hasDialog = hasVisibleDialog();
   const nativeFullscreen = isNativeFullscreen();
   if (target) {

@@ -111,11 +111,11 @@ export function frameVideoBridgeScript(): string {
 
     function isAdHint(element, rect, videoRect) {
       const identity = [element.id || "", typeof element.className === "string" ? element.className : "", element.getAttribute("src") || "", element.getAttribute("href") || "", element.getAttribute("aria-label") || "", element.getAttribute("title") || ""].join(" ");
-      if (/\b(?:ad|ads|advert|advertisement|banner|sponsor|promo|promotion|popunder|popup|commercial)\b|广告|赞助|推广|优惠|折扣|弹窗/i.test(identity)) return true;
+      if (/\b(?:ad|ads|advert|advertisement|banner|sponsor|promo|promotion|popunder|popup|commercial|porn|porno|adult|erotic|sex|18\s*\+|live\s*cams?)\b|广告|赞助|推广|优惠|折扣|弹窗|порно|эротик/i.test(identity)) return true;
       if (/content-sync\.xyz|tsyndicate\.com|wishapptrack\.com|mengmei8\.com|twinrdengine\.com|marzaent\.com|trafficType=popunder/i.test(identity)) return true;
       const text = (element.textContent || "").trim().slice(0, 500);
       const interactive = /^(?:A|IFRAME|IMG|BUTTON)$/.test(element.tagName) || Boolean(element.querySelector("a, iframe, img, button"));
-      return /discount|special offer|limited offer|click here|广告|赞助|推广|优惠|折扣|免费|casino|singtel/i.test(text)
+      return /discount|special offer|limited offer|click here|广告|赞助|推广|优惠|折扣|免费|casino|singtel|porn|porno|adult|erotic|sex|18\s*\+|порно|эротик/i.test(text)
         && interactive;
     }
 
