@@ -313,11 +313,13 @@ function isHighConfidenceAdOverlay(element: HTMLElement, videoRect: DOMRect): bo
   const identity = [element.id || "", typeof element.className === "string" ? element.className : "", element.getAttribute("src") || "", element.getAttribute("href") || "", element.getAttribute("aria-label") || "", element.getAttribute("title") || ""].join(" ");
   const text = (element.textContent || "").trim().slice(0, 800);
   const knownAd = /content-sync\.xyz|tsyndicate\.com|wishapptrack\.com|mengmei8\.com|twinrdengine\.com|marzaent\.com|trafficType=popunder/i.test(identity);
-  const adultAd = /\b(?:porn|porno|adult|erotic|sex|18\s*\+|live\s*cams?)\b|порно|эротик|для взрослых|广告|赞助|推广|优惠|折扣|弹窗/i.test(`${identity} ${text}`);
+  const adultAd = /\b(?:porn|porno|adult|erotic|sex|18\s*\+|live\s*cams?)\b|порно|эротик|для взрослых|фото|оживлен|广告|赞助|推广|优惠|折扣|弹窗/i.test(`${identity} ${text}`);
   if (!knownAd && !adultAd) return false;
   const hasCloseControl = Boolean(element.querySelector("button, [role='button'], [aria-label*='close' i], [title*='close' i], [aria-label*='关闭'], [title*='关闭']"));
   const hasImageOrLink = Boolean(element.querySelector("img, picture, svg, a"));
-  return knownAd || (adultAd && hasImageOrLink && hasCloseControl);
+  const styleZIndex = Number.parseInt(style.zIndex || "0", 10);
+  const floatingFrame = element.tagName === "IFRAME" && styleZIndex >= 10 && rect.width * rect.height < videoRect.width * videoRect.height * 0.7;
+  return knownAd || floatingFrame || (adultAd && hasImageOrLink && hasCloseControl);
 }
 
 function cleanupAdOverlays(): void {
@@ -891,7 +893,7 @@ function initialize(): void {
   window.addEventListener("message", receiveFrameVideoMessage);
   attachVideos();
   detectAndApply();
-  window.setInterval(() => { attachVideos(); detectAndApply(); }, 800);
+  window.setInterval(() => { attachVideos(); detectAndApply(); }, 300);
   window.setInterval(reportPlayback, 500);
 }
 

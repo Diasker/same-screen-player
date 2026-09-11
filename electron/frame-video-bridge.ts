@@ -115,7 +115,7 @@ export function frameVideoBridgeScript(): string {
       if (/content-sync\.xyz|tsyndicate\.com|wishapptrack\.com|mengmei8\.com|twinrdengine\.com|marzaent\.com|trafficType=popunder/i.test(identity)) return true;
       const text = (element.textContent || "").trim().slice(0, 500);
       const interactive = /^(?:A|IFRAME|IMG|BUTTON)$/.test(element.tagName) || Boolean(element.querySelector("a, iframe, img, button"));
-      return /discount|special offer|limited offer|click here|广告|赞助|推广|优惠|折扣|免费|casino|singtel|porn|porno|adult|erotic|sex|18\s*\+|порно|эротик/i.test(text)
+      return /discount|special offer|limited offer|click here|广告|赞助|推广|优惠|折扣|免费|casino|singtel|porn|porno|adult|erotic|sex|18\s*\+|порно|эротик|фото|оживлен|для взрослых/i.test(text)
         && interactive;
     }
 
@@ -150,7 +150,9 @@ export function frameVideoBridgeScript(): string {
         const rect = element.getBoundingClientRect();
         if (rect.width <= 2 || rect.height <= 2 || !intersects(rect, videoRect)) return;
         if (rect.width * rect.height > videoRect.width * videoRect.height * 0.85) return;
-        if (!isAdHint(element, rect, videoRect)) return;
+        const styleZIndex = Number.parseInt(style.zIndex || "0", 10);
+        const floatingFrame = element.tagName === "IFRAME" && styleZIndex >= 10 && rect.width * rect.height < videoRect.width * videoRect.height * 0.7;
+        if (!floatingFrame && !isAdHint(element, rect, videoRect)) return;
         element.style.setProperty("display", "none", "important");
       });
     }
