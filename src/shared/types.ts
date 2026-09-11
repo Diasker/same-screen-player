@@ -235,18 +235,23 @@ function split(first: LayoutNode, second: LayoutNode, orientation: Orientation):
   return { kind: "split", orientation, ratio: 0.5, first, second };
 }
 
+function splitSequence(nodes: LayoutNode[], orientation: Orientation): LayoutNode {
+  if (nodes.length === 0) throw new Error("Cannot split an empty sequence");
+  if (nodes.length === 1) return nodes[0];
+  const firstCount = 1;
+  const first = nodes.slice(0, firstCount)[0];
+  const second = splitSequence(nodes.slice(firstCount), orientation);
+  return { kind: "split", orientation, ratio: firstCount / nodes.length, first, second };
+}
+
 function makeGrid(columns: number, rows: number): LayoutNode {
   const columnNodes: LayoutNode[] = [];
   for (let column = 0; column < columns; column += 1) {
     const panes: LayoutNode[] = [];
     for (let row = 0; row < rows; row += 1) panes.push({ kind: "pane", paneId: `pane-${column * rows + row + 1}` });
-    let columnNode = panes[0];
-    for (let index = 1; index < panes.length; index += 1) columnNode = split(columnNode, panes[index], "vertical");
-    columnNodes.push(columnNode);
+    columnNodes.push(splitSequence(panes, "vertical"));
   }
-  let result = columnNodes[0];
-  for (let index = 1; index < columnNodes.length; index += 1) result = split(result, columnNodes[index], "horizontal");
-  return result;
+  return splitSequence(columnNodes, "horizontal");
 }
 
 export function createPreset(preset: Preset): LayoutNode {

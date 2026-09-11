@@ -17,6 +17,16 @@ describe("layout model", () => {
     expect(getPaneIds(createPreset("grid-3x2"))).toHaveLength(6);
   });
 
+  it("uses equal recursive ratios for grid presets", () => {
+    const four = createPreset("grid-2x2");
+    const six = createPreset("grid-3x2");
+    expect(four.kind).toBe("split");
+    expect((four as { ratio: number }).ratio).toBe(0.5);
+    expect(six.kind).toBe("split");
+    expect((six as { ratio: number }).ratio).toBeCloseTo(1 / 3);
+    expect(((six as { second: { ratio: number } }).second).ratio).toBe(0.5);
+  });
+
   it("clamps divider ratios to a usable range", () => {
     const layout = createPreset("split-2");
     expect(setRatioAtPath(layout, [], 0).kind).toBe("split");

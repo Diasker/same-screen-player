@@ -226,7 +226,7 @@ function authenticationUrlFor(value: string): string | null {
   }
 }
 
-function PaneView(props: PaneViewProps): ReactElement {
+const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
   const { runtime } = props;
   const partition = partitionFor(runtime);
   const webviewRef = useRef<WebviewElement | null>(null);
@@ -875,7 +875,13 @@ function PaneView(props: PaneViewProps): ReactElement {
       {runtime.url && props.interactionMode === "app" && !showControls && <button className="pane-badge" onPointerDown={(event) => event.stopPropagation()} onClick={revealControls}>{runtime.error ? "播放受限" : runtime.playerStatus === "unrecognized" ? "播放器未识别" : runtime.playing ? "播放中" : "已暂停"} · 控制</button>}
     </div>
   );
-}
+}, (previous, next) => (
+  previous.runtime === next.runtime
+  && previous.active === next.active
+  && previous.interactionMode === next.interactionMode
+  && previous.debugOverlays === next.debugOverlays
+  && previous.guestPreloadUrl === next.guestPreloadUrl
+));
 
 function LayoutDivider({ divider, onResize }: { divider: DividerRect; onResize: (path: number[], ratio: number) => void }): ReactElement {
   const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -919,6 +925,7 @@ type LayoutSurfaceProps = {
 
 function LayoutSurface(props: LayoutSurfaceProps): ReactElement {
   const geometry = useMemo(() => getGeometry(props.layout), [props.layout]);
+  const orderedPanes = useMemo(() => [...geometry.panes].sort((first, second) => first.paneId.localeCompare(second.paneId)), [geometry.panes]);
   const paneRefs = useRef(new Map<string, HTMLDivElement>());
   const dragRef = useRef<{ paneId: string; dragging: boolean; startX: number; startY: number; offsetX: number; offsetY: number; targetPaneId: string | null } | null>(null);
   const [dragState, setDragState] = useState<{ paneId: string; dragging: boolean; startX: number; startY: number; offsetX: number; offsetY: number; targetPaneId: string | null } | null>(null);
@@ -1006,7 +1013,7 @@ function LayoutSurface(props: LayoutSurfaceProps): ReactElement {
 
   return (
     <div className="layout-surface">
-      {geometry.panes.map((rect) => {
+      {orderedPanes.map((rect) => {
         const runtime = props.runtimes[rect.paneId] ?? makeRuntime(rect.paneId);
         const isDragged = dragState?.paneId === rect.paneId && dragState.dragging;
         const isDropTarget = dragState?.targetPaneId === rect.paneId;
