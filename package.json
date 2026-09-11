@@ -14,7 +14,9 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
+    "@ghostery/adblocker": "^2.18.2",
     "@ghostery/adblocker-electron": "^2.18.2",
+    "@ghostery/adblocker-electron-preload": "^2.18.2",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "ws": "^8.21.3"

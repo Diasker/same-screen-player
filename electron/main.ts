@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, screen, session, webContents, webFrameMain } from "electron";
 import { ElectronBlocker } from "@ghostery/adblocker-electron";
+import { adsAndTrackingLists } from "@ghostery/adblocker";
 import { existsSync, promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -38,6 +39,8 @@ import { isKnownAdRequest } from "./ad-navigation";
 import { hostMatchesAdblockRule, normalizeAdblockHost } from "./adblock-policy";
 import { loadLocalVideoDirectory, saveLocalVideoPath } from "./local-video-preferences";
 
+const GHOSTERY_PRELOAD_PATH = require.resolve("@ghostery/adblocker-electron-preload");
+
 app.userAgentFallback = chromeUserAgent();
 const runtimeFlags = {
   debugOverlays: debugOverlaysEnabled(process.argv, Boolean(process.env.VITE_DEV_SERVER_URL)),
@@ -75,6 +78,7 @@ const compatibilityResourceTypes = new Set([
 const challengeNavigation = new Map<string, ChallengeNavigationState>();
 const challengeModePanes = new Set<string>();
 const installedBlockingSessions = new WeakSet<Electron.Session>();
+const installedCosmeticSessions = new WeakSet<Electron.Session>();
 const installedSessionDiagnostics = new WeakSet<Electron.Session>();
 const headerDiagnosticSessions = new WeakSet<Electron.Session>();
 const knownPartitions = new Set<string>(["persist:shared"]);
@@ -93,6 +97,10 @@ function layoutFilePath(): string {
 
 function proxySettingsFilePath(): string {
   return path.join(app.getPath("userData"), "proxy-settings.json");
+}
+
+function adblockCachePath(): string {
+  return path.join(app.getPath("userData"), "adblock-engine.bin");
 }
 
 function isSafeUrl(value: unknown): value is string {
@@ -868,8 +876,31 @@ function registerIpc(): void {
 }
 
 async function setupAdblock(): Promise<void> {
+  ipcMain.removeHandler("@ghostery/adblocker/inject-cosmetic-filters");
+  ipcMain.removeHandler("@ghostery/adblocker/is-mutation-observer-enabled");
+  ipcMain.handle("@ghostery/adblocker/inject-cosmetic-filters", async (event, url: unknown, message: unknown) => {
+    if (!blocker || typeof url !== "string") return;
+    const paneId = paneWebContents.get(event.sender.id);
+    const pageHost = paneId ? paneHosts.get(paneId) : undefined;
+    if (paneId && (isAdblockDisabledForUrl(paneId, url) || (pageHost !== undefined && isAdblockDisabledForHost(paneId, pageHost)))) return;
+    await blocker.onInjectCosmeticFilters(event, url, message as undefined | { classes: string[]; hrefs: string[]; ids: string[]; lifecycle: "start" | "dom-update" });
+  });
+  ipcMain.handle("@ghostery/adblocker/is-mutation-observer-enabled", () => Boolean(blocker?.config.enableMutationObserver));
   try {
-    blocker = await ElectronBlocker.fromPrebuiltAdsAndTracking(fetch);
+    const cachePath = adblockCachePath();
+    blocker = await ElectronBlocker.fromLists(fetch, adsAndTrackingLists, {
+      enableMutationObserver: true,
+      loadExtendedSelectors: true,
+      loadCosmeticFilters: true,
+      loadGenericCosmeticsFilters: true,
+    }, {
+      path: cachePath,
+      read: async (value) => new Uint8Array(await fs.readFile(value)),
+      write: async (value, data) => {
+        await fs.mkdir(path.dirname(value), { recursive: true });
+        await fs.writeFile(value, data);
+      },
+    });
     for (const partition of knownPartitions) installAdblockForSession(session.fromPartition(partition));
   } catch (error) {
     console.warn("Ad blocking rules could not be loaded:", error);
@@ -878,6 +909,10 @@ async function setupAdblock(): Promise<void> {
 
 function installAdblockForSession(targetSession: Electron.Session): void {
   installSessionDiagnostics(targetSession);
+  if (blocker && !installedCosmeticSessions.has(targetSession)) {
+    installedCosmeticSessions.add(targetSession);
+    targetSession.registerPreloadScript({ type: "frame", filePath: GHOSTERY_PRELOAD_PATH });
+  }
   if (!blocker || installedBlockingSessions.has(targetSession)) return;
   installedBlockingSessions.add(targetSession);
   targetSession.webRequest.onBeforeRequest({ urls: ["<all_urls>"] }, (details, callback) => {
@@ -894,7 +929,7 @@ function installAdblockForSession(targetSession: Electron.Session): void {
       callback({});
       return;
     }
-    if (paneId && isAdblockDisabledForHost(paneId, host)) {
+    if (paneId && (isAdblockDisabledForHost(paneId, host) || (pageHost !== undefined && isAdblockDisabledForHost(paneId, pageHost)))) {
       callback({});
       return;
     }
