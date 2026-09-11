@@ -909,10 +909,6 @@ async function setupAdblock(): Promise<void> {
 
 function installAdblockForSession(targetSession: Electron.Session): void {
   installSessionDiagnostics(targetSession);
-  if (blocker && !installedCosmeticSessions.has(targetSession)) {
-    installedCosmeticSessions.add(targetSession);
-    targetSession.registerPreloadScript({ type: "frame", filePath: GHOSTERY_PRELOAD_PATH });
-  }
   if (!blocker || installedBlockingSessions.has(targetSession)) return;
   installedBlockingSessions.add(targetSession);
   targetSession.webRequest.onBeforeRequest({ urls: ["<all_urls>"] }, (details, callback) => {
@@ -1006,6 +1002,10 @@ function isVideoRequest(url: string, resourceType: string, pageHost?: string): b
 function configureSession(targetSession: Electron.Session): void {
   installFingerprintForSession(targetSession);
   installHeaderDiagnostics(targetSession);
+  if (!installedCosmeticSessions.has(targetSession)) {
+    installedCosmeticSessions.add(targetSession);
+    targetSession.registerPreloadScript({ type: "frame", filePath: GHOSTERY_PRELOAD_PATH });
+  }
 }
 
 function createWindow(): void {
