@@ -35,6 +35,7 @@ import { helperPath, WindowsWindowHelper } from "./windows-helper";
 import { frameVideoBridgeScript } from "./frame-video-bridge";
 import { debugOverlaysEnabled } from "../src/shared/debug-overlays";
 import { isKnownAdRequest } from "./ad-navigation";
+import { hostMatchesAdblockRule, normalizeAdblockHost } from "./adblock-policy";
 import { loadLocalVideoDirectory, saveLocalVideoPath } from "./local-video-preferences";
 
 app.userAgentFallback = chromeUserAgent();
@@ -58,7 +59,6 @@ type FrameCreatedListener = (event: Electron.Event, details: Electron.FrameCreat
 type FrameFinishListener = (event: Electron.Event, isMainFrame: boolean, frameProcessId: number, frameRoutingId: number) => void;
 const guestBindings = new Map<number, { paneId: string; contents: Electron.WebContents; onBeforeInput: BeforeInputListener; onEnterFullscreen: () => void; onLeaveFullscreen: () => void; onWillNavigate: NavigationListener; onNavigate: NavigationListener; onNavigateInPage: NavigationListener; onFrameCreated: FrameCreatedListener; onFrameFinish: FrameFinishListener; onDestroyed: () => void }>();
 const disabledAdblockRules = new Set<string>();
-const disabledAdblockPanes = new Set<string>();
 const compatibilityResourceTypes = new Set([
   "mainframe",
   "subframe",
@@ -278,6 +278,23 @@ function sendProxyStatus(scope: "global" | "pane", ok: boolean, message?: string
   sendWindowMessage("proxy:status", { scope, ok, ...(paneId ? { paneId } : {}), ...(message ? { message } : {}) });
 }
 
+function isAdblockDisabledForHost(paneId: string, host: unknown): boolean {
+  const normalized = normalizeAdblockHost(host);
+  if (!normalized) return false;
+  for (const rule of disabledAdblockRules) {
+    const separator = rule.indexOf("|");
+    if (separator < 0) continue;
+    const scope = rule.slice(0, separator);
+    if ((scope === paneId || scope === "*") && hostMatchesAdblockRule(normalized, rule.slice(separator + 1))) return true;
+  }
+  return false;
+}
+
+function isAdblockDisabledForUrl(paneId: string, value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  try { return isAdblockDisabledForHost(paneId, new URL(value).hostname); } catch { return false; }
+}
+
 function recordCloudflareDiagnostic(paneId: string, url: unknown, status: string, navigationCount: number, httpStatus?: number): void {
   let host = "unknown";
   try {
@@ -291,7 +308,7 @@ function recordCloudflareDiagnostic(paneId: string, url: unknown, status: string
     status,
     navigationCount,
     httpStatus: typeof httpStatus === "number" ? httpStatus : undefined,
-    adblockEnabled: !disabledAdblockPanes.has(paneId),
+    adblockEnabled: !isAdblockDisabledForUrl(paneId, url),
   };
   void fs.mkdir(path.dirname(layoutFilePath()), { recursive: true })
     .then(() => fs.appendFile(path.join(app.getPath("userData"), "cloudflare-diagnostics.log"), `${JSON.stringify(entry)}\n`, "utf8"))
@@ -448,7 +465,7 @@ function bindGuest(paneId: string, webContentsId: number): void {
     sendWindowMessage("window:html-fullscreen-change", paneId, false);
   };
   const onWillNavigate: NavigationListener = (event, url) => {
-    if (isKnownAdRequest(url) && !disabledAdblockPanes.has(paneId)) {
+    if (isKnownAdRequest(url) && !isAdblockDisabledForUrl(paneId, url)) {
       event.preventDefault();
       return;
     }
@@ -833,16 +850,17 @@ function registerIpc(): void {
   });
   ipcMain.handle("pane:setAdblock", (_event, paneId: unknown, host: unknown, enabled: unknown) => {
     if (typeof paneId !== "string" || typeof host !== "string") return false;
-    const key = `${paneId}|${host.toLowerCase()}`;
+    const normalizedHost = normalizeAdblockHost(host);
+    if (!normalizedHost) return false;
+    const key = `${paneId}|${normalizedHost}`;
     if (enabled) {
-      disabledAdblockPanes.delete(paneId);
       disabledAdblockRules.delete(key);
     } else {
-      disabledAdblockPanes.add(paneId);
       disabledAdblockRules.add(key);
     }
     return true;
   });
+  ipcMain.handle("pane:getAdblock", (_event, paneId: unknown, host: unknown) => typeof paneId === "string" && typeof host === "string" ? !isAdblockDisabledForHost(paneId, host) : true);
   ipcMain.handle("session:clear", async () => {
     await Promise.all([...knownPartitions].map((partition) => session.fromPartition(partition).clearStorageData()));
     return true;
@@ -872,19 +890,15 @@ function installAdblockForSession(targetSession: Electron.Session): void {
       return;
     }
     const pageHost = paneId ? paneHosts.get(paneId) : undefined;
-    if (shouldBypassAdblockForChallenge(details.url, details.resourceType, Boolean(paneId && disabledAdblockPanes.has(paneId)))) {
+    if (shouldBypassAdblockForChallenge(details.url, details.resourceType, false)) {
       callback({});
       return;
     }
-    if (paneId && (
-      disabledAdblockRules.has(`${paneId}|${host}`) ||
-      disabledAdblockRules.has(`*|${host}`) ||
-      (pageHost !== undefined && disabledAdblockRules.has(`${paneId}|${pageHost}`))
-    )) {
+    if (paneId && isAdblockDisabledForHost(paneId, host)) {
       callback({});
       return;
     }
-    if (!disabledAdblockPanes.has(paneId ?? "") && isKnownAdRequest(details.url)) {
+    if (paneId && isKnownAdRequest(details.url) && !isAdblockDisabledForUrl(paneId, details.url)) {
       callback({ cancel: true });
       return;
     }

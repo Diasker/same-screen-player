@@ -60,6 +60,7 @@ contextBridge.exposeInMainWorld("desktop", {
   exitWebpageFullscreen: (paneId?: string): Promise<boolean> => ipcRenderer.invoke("window:exitWebpageFullscreen", paneId),
   setAdblock: (paneId: string, host: string, enabled: boolean): Promise<boolean> =>
     ipcRenderer.invoke("pane:setAdblock", paneId, host, enabled),
+  getAdblock: (paneId: string, host: string): Promise<boolean> => ipcRenderer.invoke("pane:getAdblock", paneId, host),
   setChallengeMode: (paneId: string, enabled: boolean): Promise<boolean> =>
     ipcRenderer.invoke("pane:setChallengeMode", paneId, enabled),
   reportChallengeState: (paneId: string, state: unknown): Promise<boolean> =>

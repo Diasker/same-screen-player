@@ -24,6 +24,7 @@ interface DesktopApi {
   openAuthWindow: (url: string, partition: string) => Promise<boolean>;
   exitWebpageFullscreen: (paneId?: string) => Promise<boolean>;
   setAdblock: (paneId: string, host: string, enabled: boolean) => Promise<boolean>;
+  getAdblock: (paneId: string, host: string) => Promise<boolean>;
   setChallengeMode: (paneId: string, enabled: boolean) => Promise<boolean>;
   reportChallengeState: (paneId: string, state: unknown) => Promise<boolean>;
   inspectFingerprint: (paneId: string) => Promise<unknown>;

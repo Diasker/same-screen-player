@@ -120,17 +120,6 @@ function hostFromUrl(value: string): string | null {
   }
 }
 
-function siteKey(host: string): string {
-  const parts = host.split(".").filter(Boolean);
-  return parts.length > 2 ? parts.slice(-2).join(".") : host;
-}
-
-function isSameSiteNavigation(source: string, target: string): boolean {
-  const sourceHost = hostFromUrl(source);
-  const targetHost = hostFromUrl(target);
-  return Boolean(sourceHost && targetHost && siteKey(sourceHost) === siteKey(targetHost));
-}
-
 function formatTime(value: number): string {
   if (!Number.isFinite(value) || value < 0) return "00:00";
   const total = Math.floor(value);
@@ -247,7 +236,9 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
   const [proxyEditorOpen, setProxyEditorOpen] = useState(false);
   const [proxyDraft, setProxyDraft] = useState<HttpProxyEndpoint>(() => ({ ...runtime.proxy.custom }));
   const [proxyEditorError, setProxyEditorError] = useState<string | null>(null);
+  const [popupNotice, setPopupNotice] = useState<string | null>(null);
   const controlsHideTimerRef = useRef<number | null>(null);
+  const popupNoticeTimerRef = useRef<number | null>(null);
   runtimeRef.current = runtime;
   activeRef.current = props.active;
   onUpdateRef.current = props.onUpdate;
@@ -287,6 +278,14 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
 
   useEffect(() => () => {
     if (controlsHideTimerRef.current !== null) window.clearTimeout(controlsHideTimerRef.current);
+    if (popupNoticeTimerRef.current !== null) window.clearTimeout(popupNoticeTimerRef.current);
+  }, []);
+
+  const showPopupNotice = useCallback((target: string) => {
+    if (popupNoticeTimerRef.current !== null) window.clearTimeout(popupNoticeTimerRef.current);
+    const host = hostFromUrl(target);
+    setPopupNotice(host ? `已拦截 ${host} 的弹窗` : "已拦截弹窗");
+    popupNoticeTimerRef.current = window.setTimeout(() => { popupNoticeTimerRef.current = null; setPopupNotice(null); }, 3000);
   }, []);
 
   const setWebviewRef = useCallback((element: HTMLElement | null) => {
@@ -324,6 +323,15 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
   }, [navigationState.canGoBack, navigationState.canGoForward]);
 
   useEffect(() => setDraftUrl(runtime.mediaSource === "local" ? "" : runtime.url), [runtime.mediaSource, runtime.url]);
+
+  useEffect(() => {
+    if (runtime.mediaSource === "local" || !runtime.url) return;
+    const host = hostFromUrl(runtime.url);
+    if (!host) return;
+    void window.desktop.getAdblock(runtime.paneId, host).then((enabled) => {
+      if (runtimeRef.current.url === runtime.url && runtimeRef.current.mediaSource === "network") onUpdateRef.current({ adblockEnabled: enabled });
+    }).catch(() => undefined);
+  }, [runtime.mediaSource, runtime.paneId, runtime.url]);
 
   useEffect(() => {
     const webview = webviewRef.current;
@@ -569,12 +577,7 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
         void window.desktop.openAuthWindow(target, partition);
         return;
       }
-      // Same-site links (e.g. site cards that open in a new tab) navigate this pane in place
-      // instead of being silently blocked.
-      if (isSameSiteNavigation(runtimeRef.current.url, target)) {
-        setDraftUrl(target);
-        props.onNavigate(target);
-      }
+      showPopupNotice(target);
     };
     const onFocus = () => onActiveRef.current();
     const onWebviewMouseMove = (event: Event) => {
@@ -865,6 +868,7 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
           <div className="proxy-form-actions"><button className="icon-button" onClick={() => setProxyEditorOpen(false)}>取消</button><button className="icon-button primary" onClick={savePaneProxy}>保存</button></div>
         </div>
       )}
+      {popupNotice && <div className="pane-popup-notice" role="status">{popupNotice}</div>}
       {showPaneNotice && (
         <div className="pane-notice" role={visibleLoadError ? "alert" : "status"} onPointerDown={(event) => event.stopPropagation()}>
           <span>{visibleLoadError?.message || (runtime.cloudflareStatus === "detected" ? "检测到 Cloudflare 验证，已放行验证资源，请在当前页面完成验证。" : runtime.cloudflareStatus === "looped" ? "验证仍在循环，应用已停止自动刷新。" : runtime.error || (runtime.playerStatus === "challenge" ? "请在当前分屏完成 Cloudflare 验证" : "无法识别播放器，已保留网页兼容画面"))}</span>
