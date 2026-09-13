@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { AdblockStatus, BlockedNavigation } from "./shared/adblock";
 import type { CSSProperties, ReactElement } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import {
@@ -31,7 +32,7 @@ import {
 } from "./shared/types";
 import { resolveEscapeAction, toggleInteractionMode } from "./shared/interaction";
 import { shouldShowPaneNotice } from "./shared/debug-overlays";
-import { httpLoadError, networkLoadError, samePageUrl, type PageLoadError } from "./shared/load-errors";
+import { httpLoadError, networkLoadError, samePageUrl, playbackResolvesHttpError, type PageLoadError } from "./shared/load-errors";
 
 type WebviewElement = HTMLElement & {
   loadURL: (url: string) => Promise<void>;
@@ -61,7 +62,7 @@ const StableWebview = memo(function StableWebview({ partition, preload, onRef }:
       partition={partition}
       allowpopups={true}
       allowFullScreen={true}
-      webpreferences="contextIsolation=yes,sandbox=yes,nativeWindowOpen=no"
+      webpreferences="contextIsolation=yes,sandbox=yes"
     />
   );
 });
@@ -236,9 +237,10 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
   const [proxyEditorOpen, setProxyEditorOpen] = useState(false);
   const [proxyDraft, setProxyDraft] = useState<HttpProxyEndpoint>(() => ({ ...runtime.proxy.custom }));
   const [proxyEditorError, setProxyEditorError] = useState<string | null>(null);
-  const [popupNotice, setPopupNotice] = useState<string | null>(null);
+  const [popupNotice, setPopupNotice] = useState<BlockedNavigation | null>(null);
+  const [adblockStatus, setAdblockStatus] = useState<AdblockStatus | null>(null);
+  const [allowError, setAllowError] = useState<string | null>(null);
   const controlsHideTimerRef = useRef<number | null>(null);
-  const popupNoticeTimerRef = useRef<number | null>(null);
   runtimeRef.current = runtime;
   activeRef.current = props.active;
   onUpdateRef.current = props.onUpdate;
@@ -278,15 +280,18 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
 
   useEffect(() => () => {
     if (controlsHideTimerRef.current !== null) window.clearTimeout(controlsHideTimerRef.current);
-    if (popupNoticeTimerRef.current !== null) window.clearTimeout(popupNoticeTimerRef.current);
   }, []);
 
-  const showPopupNotice = useCallback((target: string) => {
-    if (popupNoticeTimerRef.current !== null) window.clearTimeout(popupNoticeTimerRef.current);
-    const host = hostFromUrl(target);
-    setPopupNotice(host ? `已拦截 ${host} 的弹窗` : "已拦截弹窗");
-    popupNoticeTimerRef.current = window.setTimeout(() => { popupNoticeTimerRef.current = null; setPopupNotice(null); }, 3000);
-  }, []);
+  useEffect(() => {
+    const offBlocked = window.desktop.onAdblockBlocked(event => {
+      if (event.paneId === runtime.paneId) { setPopupNotice(event); setAllowError(null); }
+    });
+    const offStatus = window.desktop.onAdblockStatus(setAdblockStatus);
+    let disposed = false;
+    void window.desktop.getAdblockStatus().then(value => { if (!disposed) setAdblockStatus(value); });
+    return () => { disposed = true; offBlocked(); offStatus(); };
+  }, [runtime.paneId]);
+  useEffect(() => { setPopupNotice(null); setAllowError(null); }, [runtime.url, partition]);
 
   const setWebviewRef = useCallback((element: HTMLElement | null) => {
     const nextWebview = element as WebviewElement | null;
@@ -338,11 +343,10 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
     if (!webview) return;
     try {
       webview.send("pane-activity", props.active);
-      webview.send("set-mute", runtime.muted);
       webview.send("set-focus-mode", runtime.focusModeEnabled);
     } catch {
     }
-  }, [props.active, runtime.muted, runtime.focusModeEnabled]);
+  }, [props.active, runtime.focusModeEnabled]);
 
   useEffect(() => {
     void window.desktop.setChallengeMode(runtime.paneId, !isLocalVideo && (runtime.cloudflareStatus === "detected" || runtime.cloudflareStatus === "looped"));
@@ -445,10 +449,15 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
         return;
       }
       if (message.channel === "video-state") {
-        if (pageLoadErrorRef.current) return;
         const value = (message.args?.[0] ?? {}) as { userPauseIntent?: unknown };
         const playback = normalizePlayback(value, currentRuntime.playback);
-        const patch: Partial<PaneRuntime> = { playback, playing: playback.playing, muted: playback.muted };
+        if (pageLoadErrorRef.current) {
+          if (!playbackResolvesHttpError(pageLoadErrorRef.current, navigationUrlRef.current, playback)) return;
+          updateLoadError(null);
+        }
+        const patch: Partial<PaneRuntime> = { playback, playing: playback.playing };
+        // Observations update the controls; they must never echo a mute command.
+        if (playback.hasVideo) patch.muted = playback.muted;
         if (typeof value.userPauseIntent === "boolean") patch.userPauseIntent = value.userPauseIntent;
         if (playback.hasVideo) {
           patch.playerStatus = "ready";
@@ -568,17 +577,6 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
     const onProcessGone = () => {
       if (webviewRef.current === webview) updateLoadError({ kind: "crashed", url: navigationUrlRef.current, message: "网页进程已崩溃，请重新加载" });
     };
-    const onNewWindow = (event: Event) => {
-      const popup = event as Event & { url?: string; preventDefault?: () => void };
-      popup.preventDefault?.();
-      const target = popup.url;
-      if (!target || target === "about:blank") return;
-      if (isAuthenticationUrl(target)) {
-        void window.desktop.openAuthWindow(target, partition);
-        return;
-      }
-      showPopupNotice(target);
-    };
     const onFocus = () => onActiveRef.current();
     const onWebviewMouseMove = (event: Event) => {
       if (props.interactionMode !== "app") return;
@@ -598,7 +596,6 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
     webview.addEventListener("did-navigate-in-page", onNavigation);
     webview.addEventListener("did-fail-load", onFailedLoad);
     webview.addEventListener("render-process-gone", onProcessGone);
-    webview.addEventListener("new-window", onNewWindow);
     webview.addEventListener("focus", onFocus);
     webview.addEventListener("mousemove", onWebviewMouseMove);
     webview.addEventListener("mouseleave", onWebviewMouseLeave);
@@ -611,7 +608,6 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
       webview.removeEventListener("did-navigate-in-page", onNavigation);
       webview.removeEventListener("did-fail-load", onFailedLoad);
       webview.removeEventListener("render-process-gone", onProcessGone);
-      webview.removeEventListener("new-window", onNewWindow);
       webview.removeEventListener("focus", onFocus);
       webview.removeEventListener("mousemove", onWebviewMouseMove);
       webview.removeEventListener("mouseleave", onWebviewMouseLeave);
@@ -624,7 +620,8 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
       if (event.code === "Space" || event.key.toLowerCase() === "m") {
         event.preventDefault();
         const isMute = event.key.toLowerCase() === "m";
-        webviewRef.current?.send("video-command", isMute ? { type: "toggleMuted" } : { type: "toggle" });
+        if (event.repeat && isMute) return;
+        webviewRef.current?.send("video-command", isMute ? { type: "setMuted", value: !runtimeRef.current.muted } : { type: "toggle" });
         if (!isMute) onUpdateRef.current({ userPauseIntent: runtimeRef.current.playing });
         if (isMute) onUpdateRef.current({ muted: !runtimeRef.current.muted });
         return;
@@ -849,6 +846,11 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
             <button className="icon-button" onClick={hideControls}>收起</button>
             <button className="icon-button danger" onClick={props.onRemove}>关闭</button>
           </div>
+          {!isLocalVideo && adblockStatus && <div className="adblock-status" role="status">
+            {adblockStatus.state === "unavailable" ? "广告规则不可用" : adblockStatus.source === "bundled" ? "使用内置广告规则" : adblockStatus.source === "cache" ? "使用缓存广告规则" : "广告规则已更新"}
+            {adblockStatus.updatedAt && ` · ${new Date(adblockStatus.updatedAt).toLocaleString()}`}
+            {adblockStatus.message && ` · ${adblockStatus.message}`}
+          </div>}
           {runtime.proxyAutoIsolated && <div className="proxy-isolation-note">此分屏使用独立代理，Cookie 不再与共享会话同步；改回“跟随全局代理”可恢复共享。</div>}
           {runtime.error && <div className="pane-error">{runtime.error}</div>}
           {runtime.playerStatus === "unrecognized" && !runtime.error && <div className="pane-error">无法识别播放器，已保留网页兼容画面。</div>}
@@ -868,7 +870,16 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
           <div className="proxy-form-actions"><button className="icon-button" onClick={() => setProxyEditorOpen(false)}>取消</button><button className="icon-button primary" onClick={savePaneProxy}>保存</button></div>
         </div>
       )}
-      {popupNotice && <div className="pane-popup-notice" role="status">{popupNotice}</div>}
+      {popupNotice && <div className="pane-popup-notice" role="status" onPointerDown={event => event.stopPropagation()}>
+        <span>已阻止 {popupNotice.host}：{popupNotice.reason === "rule" ? "广告规则命中" : popupNotice.reason === "playback" ? "播放附带跳转" : "未确认用途的跳转"}</span>
+        {popupNotice.canAllow && <button className="icon-button" onClick={() => {
+          void window.desktop.allowBlockedNavigation(runtime.paneId, popupNotice.id).then(ok => {
+            if (ok) setPopupNotice(null); else setAllowError("该跳转已过期，请重新操作");
+          });
+        }}>本次放行</button>}
+        <button className="icon-button" aria-label="关闭拦截提示" onClick={() => setPopupNotice(null)}>关闭</button>
+        {allowError && <span>{allowError}</span>}
+      </div>}
       {showPaneNotice && (
         <div className="pane-notice" role={visibleLoadError ? "alert" : "status"} onPointerDown={(event) => event.stopPropagation()}>
           <span>{visibleLoadError?.message || (runtime.cloudflareStatus === "detected" ? "检测到 Cloudflare 验证，已放行验证资源，请在当前页面完成验证。" : runtime.cloudflareStatus === "looped" ? "验证仍在循环，应用已停止自动刷新。" : runtime.error || (runtime.playerStatus === "challenge" ? "请在当前分屏完成 Cloudflare 验证" : "无法识别播放器，已保留网页兼容画面"))}</span>

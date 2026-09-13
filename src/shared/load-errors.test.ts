@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { httpLoadError, networkLoadError, samePageUrl } from "./load-errors";
+import { httpLoadError, networkLoadError, samePageUrl, playbackResolvesHttpError } from "./load-errors";
+import type { PlaybackSnapshot } from "./types";
 
 const pageUrl = "https://example.com/video";
 
@@ -38,5 +39,16 @@ describe("page load errors", () => {
     expect(samePageUrl(`${pageUrl}#player`, pageUrl)).toBe(true);
     expect(samePageUrl(`${pageUrl}?id=1`, `${pageUrl}?id=2`)).toBe(false);
     expect(samePageUrl(undefined, pageUrl)).toBe(false);
+  });
+  it("clears a recovered Bilibili 412 only after actual playback in the same document", () => {
+    const url = "https://www.bilibili.com/video/BV123";
+    const playback: PlaybackSnapshot = { hasVideo: true, playing: true, readyState: 4, currentTime: 2, duration: 100, videoWidth: 640, videoHeight: 360, buffered: 10, volume: 1, muted: false, playerWidth: 640, playerHeight: 360, rate: 1 };
+    const error = httpLoadError(url, 412, url)!;
+    expect(playbackResolvesHttpError(error, url, playback)).toBe(true);
+    for (const patch of [{ hasVideo: false }, { playing: false }, { currentTime: 0 }, { readyState: 0 }, { videoWidth: 0 }]) expect(playbackResolvesHttpError(error, url, { ...playback, ...patch })).toBe(false);
+    expect(playbackResolvesHttpError(error, url + "?p=2", playback)).toBe(false);
+    expect(playbackResolvesHttpError(httpLoadError(url, 404, url)!, url, playback)).toBe(false);
+    expect(playbackResolvesHttpError(httpLoadError(pageUrl, 412, pageUrl)!, pageUrl, playback)).toBe(false);
+    expect(playbackResolvesHttpError({ ...error, kind: "network" }, url, playback)).toBe(false);
   });
 });

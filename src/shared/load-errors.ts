@@ -1,8 +1,23 @@
+import type { PlaybackSnapshot } from "./types";
+
 export type PageLoadError = {
   kind: "network" | "http" | "crashed";
   url: string;
   message: string;
+  statusCode?: number;
 };
+
+// Bilibili may return a 412 document, then finish Gaia verification and mount
+// the real player without a new document navigation. Keep genuine failures
+// visible until this document provides decoded, advancing video playback.
+export function playbackResolvesHttpError(error: PageLoadError, currentUrl: string, playback: PlaybackSnapshot): boolean {
+  if (error.kind !== "http" || error.statusCode !== 412 || !samePageUrl(error.url, currentUrl)) return false;
+  try {
+    const url = new URL(currentUrl);
+    if (url.protocol !== "https:" || !(url.hostname === "bilibili.com" || url.hostname.endsWith(".bilibili.com"))) return false;
+  } catch { return false; }
+  return playback.hasVideo && playback.playing && playback.readyState >= 2 && playback.currentTime > 0.2 && playback.videoWidth >= 160 && playback.videoHeight >= 90;
+}
 
 export function samePageUrl(first: string | undefined, second: string): boolean {
   try {
@@ -63,5 +78,5 @@ export function httpLoadError(url: string, statusCode: number | undefined, curre
     503: "网站服务暂时不可用，请稍后重试",
     504: "网站网关超时，请稍后重试",
   };
-  return { kind: "http", url, message: `${descriptions[statusCode] ?? "网站返回错误，请稍后重试"}（HTTP ${statusCode}）` };
+  return { kind: "http", url, statusCode, message: `${descriptions[statusCode] ?? "网站返回错误，请稍后重试"}（HTTP ${statusCode}）` };
 }

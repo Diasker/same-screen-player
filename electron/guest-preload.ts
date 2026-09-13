@@ -2,6 +2,8 @@ import { ipcRenderer, webFrame } from "electron";
 import { mainWorldFingerprintScript } from "./fingerprint";
 import { challengeSignature, observeChallengeNavigation, type CloudflareStatus, type ChallengeNavigationState, emptyChallengeNavigation } from "./cloudflare";
 
+// Session preloads filter every frame; player aggregation belongs to the top frame.
+if (process.isMainFrame) {
 try {
   void webFrame.executeJavaScript(mainWorldFingerprintScript(), false).catch(() => undefined);
 } catch {
@@ -39,6 +41,8 @@ type PlaybackSnapshot = {
 type RemoteFrameState = {
   state: PlaybackSnapshot;
   receivedAt: number;
+  playerId: string;
+  muteSequence: number;
 };
 
 type PlayerStatus = "idle" | "loading" | "ready" | "unrecognized" | "challenge";
@@ -70,7 +74,9 @@ let lastChallengeMessage = "";
 const boundVideos = new WeakSet<HTMLVideoElement>();
 const wasPlaying = new WeakMap<HTMLVideoElement, boolean>();
 const remoteFrameStates = new Map<HTMLIFrameElement, RemoteFrameState>();
-const remoteFrameMuteSynced = new WeakSet<HTMLIFrameElement>();
+const remoteFrameMuteSynced = new WeakMap<HTMLIFrameElement, Set<string>>();
+const pendingFrameMute = new WeakMap<HTMLIFrameElement, { playerId: string; sequence: number; at: number }>();
+let muteSequence = 0;
 const FRAME_VIDEO_SOURCE = "same-screen-frame-video";
 const nativeMediaPlay = HTMLMediaElement.prototype.play;
 const nativeMediaPause = HTMLMediaElement.prototype.pause;
@@ -503,7 +509,7 @@ function frameForMessage(source: MessageEventSource | null): HTMLIFrameElement |
 }
 
 function receiveFrameVideoMessage(event: MessageEvent): void {
-  const value = event.data as { source?: unknown; kind?: unknown; state?: unknown; result?: unknown } | null;
+  const value = event.data as { source?: unknown; kind?: unknown; state?: unknown; result?: unknown; playerId?: unknown; muteSequence?: unknown; nativeMuteIntent?: unknown } | null;
   if (!value || value.source !== FRAME_VIDEO_SOURCE) return;
   if (value.kind === "command-result") {
     ipcRenderer.sendToHost("focus-diagnostic", { kind: "frame-command", result: value.result });
@@ -513,11 +519,28 @@ function receiveFrameVideoMessage(event: MessageEvent): void {
   const frame = frameForMessage(event.source);
   if (!frame) return;
   const state = normalizeRemoteFrameState(value.state);
-  if (!state) return;
-  remoteFrameStates.set(frame, { state, receivedAt: Date.now() });
-  if (!remoteFrameMuteSynced.has(frame)) {
-    remoteFrameMuteSynced.add(frame);
-    if (state.muted !== paneMuted) sendFrameVideoCommand(frame, { type: "setMuted", value: paneMuted });
+  if (!state || typeof value.playerId !== "string" || value.playerId.length > 200 || !Number.isSafeInteger(value.muteSequence)) return;
+  const previous = remoteFrameStates.get(frame);
+  if (previous?.playerId === value.playerId && Number(value.muteSequence) < previous.muteSequence) return;
+  const pending = pendingFrameMute.get(frame);
+  if (pending?.playerId === value.playerId) {
+    if (Number(value.muteSequence) < pending.sequence && Date.now() - pending.at < 1500) return;
+    pendingFrameMute.delete(frame);
+  }
+  remoteFrameStates.set(frame, { state, receivedAt: Date.now(), playerId: value.playerId, muteSequence: Number(value.muteSequence) });
+  const synced = remoteFrameMuteSynced.get(frame) ?? new Set<string>();
+  if (!pending && synced.has(value.playerId) && value.nativeMuteIntent === true) {
+    const selected = mediaTarget();
+    if (selected?.kind === "frame" && selected.frame === frame) paneMuted = state.muted;
+  }
+  if (!synced.has(value.playerId)) {
+    synced.add(value.playerId);
+    if (synced.size > 128) synced.delete(synced.values().next().value!);
+    remoteFrameMuteSynced.set(frame, synced);
+    if (state.muted !== paneMuted) {
+      sendFrameVideoCommand(frame, { type: "setMuted", value: paneMuted });
+      return;
+    }
   }
   scheduleDetection();
   reportPlayback();
@@ -525,7 +548,11 @@ function receiveFrameVideoMessage(event: MessageEvent): void {
 
 function sendFrameVideoCommand(frame: HTMLIFrameElement, command: VideoCommand): void {
   try {
-    frame.contentWindow?.postMessage({ source: FRAME_VIDEO_SOURCE, command }, "*");
+    const entry = remoteFrameStates.get(frame);
+    const changesMute = command.type === "setMuted" || command.type === "setVolume";
+    const sequence = changesMute ? ++muteSequence : undefined;
+    if (changesMute && entry) pendingFrameMute.set(frame, { playerId: entry.playerId, sequence: sequence!, at: Date.now() });
+    frame.contentWindow?.postMessage({ source: FRAME_VIDEO_SOURCE, command: { ...command, ...(changesMute && entry ? { targetPlayerId: entry.playerId, muteSequence: sequence } : {}) } }, "*");
   } catch {
   }
 }
@@ -572,6 +599,9 @@ function snapshot(): PlaybackSnapshot {
 }
 
 function reportPlayback(): void {
+  const target = mediaTarget();
+  const pending = target?.kind === "frame" ? pendingFrameMute.get(target.frame) : undefined;
+  if (pending && Date.now() - pending.at < 1500) return;
   const next = snapshot();
   const previous = lastSnapshot;
   if (previous && previous.playing === next.playing && Math.abs(previous.currentTime - next.currentTime) < 0.15 && previous.duration === next.duration && Math.abs(previous.buffered - next.buffered) < 0.25 && previous.volume === next.volume && previous.muted === next.muted && previous.hasVideo === next.hasVideo && previous.videoWidth === next.videoWidth && previous.videoHeight === next.videoHeight && previous.readyState === next.readyState && previous.playerWidth === next.playerWidth && previous.playerHeight === next.playerHeight && previous.rate === next.rate) return;
@@ -644,7 +674,12 @@ function attachVideo(video: HTMLVideoElement): void {
     wasPlaying.set(video, false);
     reportPlayback();
   });
-  ["durationchange", "progress", "timeupdate", "volumechange", "ratechange", "loadedmetadata", "canplay"].forEach((eventName) => video.addEventListener(eventName, reportPlayback));
+  video.addEventListener("volumechange", () => {
+    const selected = mediaTarget();
+    if (Date.now() - lastUserInteractionAt < 900 && selected?.kind === "local" && selected.video === video) paneMuted = video.muted;
+    reportPlayback();
+  });
+  ["durationchange", "progress", "timeupdate", "ratechange", "loadedmetadata", "canplay"].forEach((eventName) => video.addEventListener(eventName, reportPlayback));
 }
 
 function attachVideos(): void {
@@ -765,13 +800,19 @@ function setMuted(muted: boolean): void {
 }
 
 function runCommand(command: VideoCommand): void {
+  if (command.type === "setMuted" || command.type === "toggleMuted") {
+    const target = mediaTarget();
+    const pending = target?.kind === "frame" ? pendingFrameMute.get(target.frame) : undefined;
+    setMuted(command.type === "setMuted" ? command.value : !(pending && Date.now() - pending.at < 1500 ? paneMuted : snapshot().muted));
+    return;
+  }
   const requestVersion = ++playRequestVersion;
   const target = mediaTarget();
   if (!target) return;
   if (target.kind === "frame") {
     let frameCommand = command;
     if (command.type === "toggle") frameCommand = { type: target.state.playing ? "pause" : "play" };
-    else if (command.type === "toggleMuted") frameCommand = { type: "setMuted", value: !target.state.muted };
+    if (command.type === "setVolume" && command.value > 0) paneMuted = false;
     if (frameCommand.type === "pause") userPauseIntent = true;
     else if (frameCommand.type === "play") userPauseIntent = false;
     sendFrameVideoCommand(target.frame, frameCommand);
@@ -812,10 +853,6 @@ function runCommand(command: VideoCommand): void {
           video.muted = false;
         }
       }
-    } else if (command.type === "toggleMuted") {
-      setMuted(!video.muted);
-    } else if (command.type === "setMuted") {
-      setMuted(Boolean(command.value));
     } else if (command.type === "setRate") {
       if (Number.isFinite(command.value)) {
         video.playbackRate = Math.min(4, Math.max(0.25, command.value));
@@ -829,10 +866,9 @@ function runCommand(command: VideoCommand): void {
 function playVideo(video: HTMLVideoElement, requestVersion: number): void {
   try {
     const pending = nativeMediaPlay.call(video);
-    void pending.catch(() => {
-      if (requestVersion !== playRequestVersion || !video.paused) return;
+    void pending.catch((error: unknown) => {
+      if (!(error instanceof DOMException) || error.name !== "NotAllowedError" || requestVersion !== playRequestVersion || !video.paused || video.muted) return;
       video.muted = true;
-      paneMuted = true;
       void nativeMediaPlay.call(video).catch(() => undefined);
     });
   } catch {
@@ -937,3 +973,5 @@ ipcRenderer.on("pane-activity", (_event, active: boolean) => {
 
 if (document.readyState === "loading") window.addEventListener("DOMContentLoaded", initialize, { once: true });
 else initialize();
+
+}

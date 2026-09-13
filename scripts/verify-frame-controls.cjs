@@ -33,7 +33,7 @@ async function runCheck() {
   const deadline = setTimeout(() => {
     console.error("Timed out verifying frame controls");
     app.exit(1);
-  }, 45000);
+  }, 90000);
   await app.whenReady();
 
   const preload = pathToFileURL(path.join(__dirname, "../dist-electron/electron/guest-preload.js")).href;
@@ -52,7 +52,7 @@ async function runCheck() {
             window.commandResults.push(event.args[0].result);
           }
         });
-        window.sendVideoCommand = (type) => guest.send("video-command", { type });
+        window.sendVideoCommand = (type, value) => guest.send("video-command", { type, value });
         guest.src = "/parent";
         document.body.appendChild(guest);
       </script>`);
@@ -122,6 +122,29 @@ async function runCheck() {
       const player = guest.mainFrame.framesInSubtree.find((frame) => frame.url === `${origin}/player` || frame.url === `http://localhost:${fixture.address().port}/player`);
       assert.ok(player, `${route}: player frame missing`);
       assert.equal(await player.executeJavaScript("document.querySelector('video').paused"), false);
+      await guest.executeJavaScript("window.lastFramePacket=null;window.addEventListener('message',e=>{if(e.data?.source==='same-screen-frame-video' && e.data.kind==='state')window.lastFramePacket=e.data})");
+
+      await player.executeJavaScript("window.muteChanges=[];document.querySelector('video').addEventListener('volumechange',()=>window.muteChanges.push(document.querySelector('video').muted))");
+      for (const muted of [false, true, false]) {
+        await readHost(`window.sendVideoCommand('setMuted', ${muted})`);
+        await eventually(() => player.executeJavaScript(`document.querySelector('video').muted === ${muted}`), `${route}: mute command not applied`);
+        await eventually(() => readHost(`window.playback?.muted === ${muted}`), `${route}: mute acknowledgement missing`);
+        const changes = await player.executeJavaScript("window.muteChanges.length");
+        await new Promise(resolve => setTimeout(resolve, 1700));
+        assert.equal(await player.executeJavaScript("window.muteChanges.length"), changes, `${route}: mute oscillated without user input`);
+      }
+      await player.executeJavaScript("document.querySelector('video').muted=true");
+      await eventually(() => readHost("window.playback?.muted === true"), `${route}: native player mute not reflected`);
+      const stale = await guest.executeJavaScript("window.lastFramePacket");
+      await readHost("window.sendVideoCommand('setVolume', 0.6)");
+      await eventually(() => player.executeJavaScript("!document.querySelector('video').muted && document.querySelector('video').volume===0.6"), `${route}: volume did not unmute`);
+      await eventually(() => readHost("window.playback?.muted === false"), `${route}: volume mute state stale`);
+      if (stale) {
+        await player.executeJavaScript(`window.parent.postMessage(${JSON.stringify(stale)}, '*')`);
+        await new Promise(resolve => setTimeout(resolve, 150));
+        assert.equal(await readHost("window.playback.muted"), false, `${route}: stale iframe report overwrote acknowledged mute`);
+      }
+      console.log(`PASS ${route}: startup mute, repeated commands, native mute and volume, no oscillation`);
 
       for (const [command, paused] of [["pause", true], ["play", false], ["toggle", true], ["toggle", false]]) {
         await readHost(`window.sendVideoCommand(${JSON.stringify(command)})`);
@@ -134,6 +157,19 @@ async function runCheck() {
         else assert.ok(finalTime > initialTime, `${route}: time did not advance after ${command}`);
         console.log(`PASS ${route}: ${command}, paused=${paused}, host state and media clock verified`);
       }
+      await player.executeJavaScript("(()=>{const old=document.querySelector('video');const replacement=old.cloneNode();replacement.srcObject=old.srcObject;old.replaceWith(replacement);replacement.play().catch(()=>{})})()");
+      await eventually(() => player.executeJavaScript("!document.querySelector('video').muted"), `${route}: replacement player lost the requested mute setting`);
+      await eventually(() => readHost("window.playback?.hasVideo && !window.playback.muted"), `${route}: replacement player did not report`);
+      console.log(`PASS ${route}: replacement player reinitialized once`);
+      await readHost("window.sendVideoCommand('toggleMuted');window.sendVideoCommand('toggleMuted')");
+      await new Promise(resolve => setTimeout(resolve, 500));
+      assert.equal(await player.executeJavaScript("document.querySelector('video').muted"), false, `${route}: fast toggles used an obsolete snapshot`);
+      await player.executeJavaScript("(()=>{const v=document.querySelector('video');v.srcObject=null;v.src='data:video/mp4;base64,AAAA';v.load()})()");
+      await eventually(() => player.executeJavaScript("!!document.querySelector('video').error"), `${route}: invalid media fixture did not fail`);
+      await readHost("window.sendVideoCommand('play')");
+      await new Promise(resolve => setTimeout(resolve, 600));
+      assert.equal(await player.executeJavaScript("document.querySelector('video').muted"), false, `${route}: a media error changed the mute setting`);
+      console.log(`PASS ${route}: rapid toggles and playback failure preserve mute intent`);
     }
   } finally {
     clearTimeout(deadline);

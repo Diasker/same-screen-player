@@ -5,6 +5,7 @@ const root = path.join(__dirname, "..");
 
 async function main() {
   const targets = [
+    { in: "electron/adblock-preload.ts", out: "dist-electron/electron/adblock-preload.js" },
     { in: "electron/guest-preload.ts", out: "dist-electron/electron/guest-preload.js" },
     { in: "electron/fingerprint-preload.ts", out: "dist-electron/electron/fingerprint-preload.js" },
   ];

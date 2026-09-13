@@ -113,7 +113,8 @@ button { cursor: pointer; }
 .pane-notice .icon-button { pointer-events: auto; }
 .pane-notice { flex-wrap: wrap; }
 .pane-notice span { min-width: 0; flex: 1 1 160px; overflow-wrap: anywhere; }
-.pane-popup-notice { position: absolute; z-index: 8; top: 10px; left: 50%; max-width: calc(100% - 24px); padding: 7px 11px; border: 1px solid #80632e; border-radius: 6px; color: #ffd59a; background: #251b0de8; box-shadow: 0 6px 18px #0008; font-size: calc(10px * var(--app-font-scale)); pointer-events: none; transform: translateX(-50%); }
+.pane-popup-notice { position: absolute; z-index: 8; top: 10px; left: 50%; max-width: calc(100% - 24px); padding: 7px 11px; border: 1px solid #80632e; border-radius: 6px; color: #ffd59a; background: #251b0de8; box-shadow: 0 6px 18px #0008; font-size: calc(10px * var(--app-font-scale)); transform: translateX(-50%); display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.adblock-status { color: #a9b5c5; font-size: 11px; padding-top: 5px; }
 .pane-badge { position: absolute; z-index: 6; top: 8px; right: 8px; padding: 4px 7px; border: 1px solid #344354; border-radius: 5px; color: #a7b5c6; background: #111923eF; font-size: calc(10px * var(--app-font-scale)); opacity: .86; }
 .pane-badge:hover { border-color: #5d7698; color: #e3ebf5; background: #253347; }
 .status-bar { height: 27px; display: flex; align-items: center; gap: 7px; padding: 0 14px; border-top: 1px solid #202936; color: #7d8999; background: #10161f; font-size: calc(10px * var(--app-font-scale)); }

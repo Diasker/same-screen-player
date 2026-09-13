@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
+import type { AdblockStatus, BlockedNavigation } from "../src/shared/adblock";
 
 let fullscreenListener: ((event: Electron.IpcRendererEvent, fullscreen: unknown) => void) | null = null;
 let htmlFullscreenListener: ((event: Electron.IpcRendererEvent, paneId: unknown, fullscreen: unknown) => void) | null = null;
@@ -61,6 +62,18 @@ contextBridge.exposeInMainWorld("desktop", {
   setAdblock: (paneId: string, host: string, enabled: boolean): Promise<boolean> =>
     ipcRenderer.invoke("pane:setAdblock", paneId, host, enabled),
   getAdblock: (paneId: string, host: string): Promise<boolean> => ipcRenderer.invoke("pane:getAdblock", paneId, host),
+  getAdblockStatus: (): Promise<AdblockStatus> => ipcRenderer.invoke("adblock:status"),
+  allowBlockedNavigation: (paneId: string, id: string): Promise<boolean> => ipcRenderer.invoke("adblock:allow", paneId, id),
+  onAdblockBlocked: (callback: (event: BlockedNavigation) => void): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, value: BlockedNavigation) => callback(value);
+    ipcRenderer.on("adblock:blocked", listener);
+    return () => ipcRenderer.removeListener("adblock:blocked", listener);
+  },
+  onAdblockStatus: (callback: (status: AdblockStatus) => void): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, value: AdblockStatus) => callback(value);
+    ipcRenderer.on("adblock:status-changed", listener);
+    return () => ipcRenderer.removeListener("adblock:status-changed", listener);
+  },
   setChallengeMode: (paneId: string, enabled: boolean): Promise<boolean> =>
     ipcRenderer.invoke("pane:setChallengeMode", paneId, enabled),
   reportChallengeState: (paneId: string, state: unknown): Promise<boolean> =>

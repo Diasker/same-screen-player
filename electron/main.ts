@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, screen, session, webContents, webFrameMain } from "electron";
-import { ElectronBlocker } from "@ghostery/adblocker-electron";
-import { adsAndTrackingLists } from "@ghostery/adblocker";
+import { AdblockService } from "./adblock-service";
+import { AdblockSubscriptions, UPDATE_INTERVAL } from "./adblock-subscriptions";
 import { existsSync, promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -27,7 +27,6 @@ import {
   isCloudflareChallengeRequest,
   observeChallengeNavigation,
   observeChallengeSignal,
-  shouldBypassAdblockForChallenge,
   type ChallengeNavigationState,
 } from "./cloudflare";
 import { ChromeSessionManager } from "./cdp";
@@ -35,11 +34,10 @@ import { chromeUserAgent, installFingerprintForSession, mainWorldFingerprintScri
 import { helperPath, WindowsWindowHelper } from "./windows-helper";
 import { frameVideoBridgeScript } from "./frame-video-bridge";
 import { debugOverlaysEnabled } from "../src/shared/debug-overlays";
-import { isKnownAdRequest } from "./ad-navigation";
 import { hostMatchesAdblockRule, normalizeAdblockHost } from "./adblock-policy";
 import { loadLocalVideoDirectory, saveLocalVideoPath } from "./local-video-preferences";
 
-const GHOSTERY_PRELOAD_PATH = require.resolve("@ghostery/adblocker-electron-preload");
+const ADBLOCK_PRELOAD_PATH = path.join(__dirname, "adblock-preload.js");
 
 app.userAgentFallback = chromeUserAgent();
 const runtimeFlags = {
@@ -49,7 +47,12 @@ const runtimeFlags = {
 let mainWindow: BrowserWindow | null = null;
 let interactionMode: InteractionMode = "web";
 let htmlFullscreenPaneId: string | null = null;
-let blocker: ElectronBlocker | null = null;
+let subscriptions: AdblockSubscriptions;
+let adblockService: AdblockService;
+let adblockUpdateTimer: ReturnType<typeof setInterval> | undefined;
+let adblockLogQueue = Promise.resolve();
+let adblockLogWindow = 0;
+let adblockLogCount = 0;
 let chromeManager: ChromeSessionManager | null = null;
 let windowsHelper: WindowsWindowHelper | null = null;
 const paneWebContents = new Map<number, string>();
@@ -62,23 +65,8 @@ type FrameCreatedListener = (event: Electron.Event, details: Electron.FrameCreat
 type FrameFinishListener = (event: Electron.Event, isMainFrame: boolean, frameProcessId: number, frameRoutingId: number) => void;
 const guestBindings = new Map<number, { paneId: string; contents: Electron.WebContents; onBeforeInput: BeforeInputListener; onEnterFullscreen: () => void; onLeaveFullscreen: () => void; onWillNavigate: NavigationListener; onNavigate: NavigationListener; onNavigateInPage: NavigationListener; onFrameCreated: FrameCreatedListener; onFrameFinish: FrameFinishListener; onDestroyed: () => void }>();
 const disabledAdblockRules = new Set<string>();
-const compatibilityResourceTypes = new Set([
-  "mainframe",
-  "subframe",
-  "media",
-  "object",
-  "script",
-  "stylesheet",
-  "font",
-  "manifest",
-  "xhr",
-  "fetch",
-  "websocket",
-]);
 const challengeNavigation = new Map<string, ChallengeNavigationState>();
 const challengeModePanes = new Set<string>();
-const installedBlockingSessions = new WeakSet<Electron.Session>();
-const installedCosmeticSessions = new WeakSet<Electron.Session>();
 const installedSessionDiagnostics = new WeakSet<Electron.Session>();
 const headerDiagnosticSessions = new WeakSet<Electron.Session>();
 const knownPartitions = new Set<string>(["persist:shared"]);
@@ -97,10 +85,6 @@ function layoutFilePath(): string {
 
 function proxySettingsFilePath(): string {
   return path.join(app.getPath("userData"), "proxy-settings.json");
-}
-
-function adblockCachePath(): string {
-  return path.join(app.getPath("userData"), "adblock-engine.bin");
 }
 
 function isSafeUrl(value: unknown): value is string {
@@ -222,7 +206,7 @@ function isAuthenticationUrl(value: unknown): value is string {
     const parsed = new URL(value);
     const host = parsed.hostname.toLowerCase();
     const pathAndQuery = `${parsed.pathname}${parsed.search}`.toLowerCase();
-    if (host === "accounts.google.com" || host.endsWith(".accounts.google.com") || host === "google.com" || host.endsWith(".google.com")) return true;
+    if (host === "accounts.google.com" || host.endsWith(".accounts.google.com")) return true;
     if (host === "passport.bilibili.com") return true;
     if (host === "bilibili.com" || host.endsWith(".bilibili.com")) return /login|signin|passport|auth|account/.test(pathAndQuery);
     return false;
@@ -303,6 +287,21 @@ function isAdblockDisabledForUrl(paneId: string, value: unknown): boolean {
   try { return isAdblockDisabledForHost(paneId, new URL(value).hostname); } catch { return false; }
 }
 
+function recordAdblockDiagnostic(entry: { paneId: string; host: string; kind: string; rule?: string }): void {
+  const now = Date.now();
+  if (now - adblockLogWindow > 60000) { adblockLogWindow = now; adblockLogCount = 0; }
+  if (++adblockLogCount > 200) return;
+  const file = path.join(app.getPath("userData"), "adblock-diagnostics.log");
+  // Only host, resource type and the static matching rule are persisted, never
+  // full navigation URLs, request headers, form bodies or cookies.
+  const line = JSON.stringify({ timestamp: new Date(now).toISOString(), ...entry, rule: entry.rule?.slice(0, 512) }) + "\n";
+  adblockLogQueue = adblockLogQueue.then(async () => {
+    const size = await fs.stat(file).then(value => value.size).catch(() => 0);
+    if (size > 1024 * 1024) await fs.writeFile(file, "");
+    await fs.appendFile(file, line, "utf8");
+  }).catch(() => undefined);
+}
+
 function recordCloudflareDiagnostic(paneId: string, url: unknown, status: string, navigationCount: number, httpStatus?: number): void {
   let host = "unknown";
   try {
@@ -375,6 +374,7 @@ function unbindGuest(webContentsId: number): void {
   binding.contents.removeListener("frame-created", binding.onFrameCreated);
   binding.contents.removeListener("did-frame-finish-load", binding.onFrameFinish);
   binding.contents.removeListener("destroyed", binding.onDestroyed);
+  adblockService?.detach(webContentsId);
   guestBindings.delete(webContentsId);
   paneWebContents.delete(webContentsId);
   panePartitions.delete(binding.paneId);
@@ -462,6 +462,7 @@ function bindGuest(paneId: string, webContentsId: number): void {
     }
     if (interactionMode !== "app" || (!isSpace && !isMute)) return;
     event.preventDefault();
+    if (isMute && input.isAutoRepeat) return;
     contents.send("video-command", isSpace ? { type: "toggle" } : { type: "toggleMuted" });
   };
   const onEnterFullscreen = () => {
@@ -473,10 +474,6 @@ function bindGuest(paneId: string, webContentsId: number): void {
     sendWindowMessage("window:html-fullscreen-change", paneId, false);
   };
   const onWillNavigate: NavigationListener = (event, url) => {
-    if (isKnownAdRequest(url) && !isAdblockDisabledForUrl(paneId, url)) {
-      event.preventDefault();
-      return;
-    }
     if (isSafeUrl(url)) return;
     if (isFileUrl(url) && authorizedLocalVideoUrls.has(url)) return;
     event.preventDefault();
@@ -823,8 +820,10 @@ function registerIpc(): void {
     recordCloudflareDiagnostic(paneId, value.url, value.status, typeof value.navigationCount === "number" ? value.navigationCount : 0);
     return true;
   });
-  ipcMain.handle("pane:register", async (_event, paneId: unknown, webContentsId: unknown, partition: unknown, pageUrl: unknown, proxy: unknown) => {
+  ipcMain.handle("pane:register", async (event, paneId: unknown, webContentsId: unknown, partition: unknown, pageUrl: unknown, proxy: unknown) => {
     if (typeof paneId !== "string" || typeof webContentsId !== "number" || typeof partition !== "string") return false;
+    const contents = webContents.fromId(webContentsId);
+    if (event.sender !== mainWindow?.webContents || !contents || contents.isDestroyed() || contents.hostWebContents !== event.sender) return false;
     if (partition !== "persist:shared" && partition !== `persist:${paneId}`) return false;
     const paneProxy = proxy === undefined ? defaultPaneProxySettings() : normalizePaneProxySettings(proxy);
     if (!paneProxy) return false;
@@ -853,11 +852,12 @@ function registerIpc(): void {
     }
     knownPartitions.add(partition);
     configureSession(session.fromPartition(partition));
-    installAdblockForSession(session.fromPartition(partition));
+    if (contents.isDestroyed()) return false;
+    adblockService.attach(paneId, contents, typeof pageUrl === "string" ? pageUrl : "");
     return true;
   });
-  ipcMain.handle("pane:setAdblock", (_event, paneId: unknown, host: unknown, enabled: unknown) => {
-    if (typeof paneId !== "string" || typeof host !== "string") return false;
+  ipcMain.handle("pane:setAdblock", (event, paneId: unknown, host: unknown, enabled: unknown) => {
+    if (event.sender !== mainWindow?.webContents || typeof paneId !== "string" || typeof host !== "string" || typeof enabled !== "boolean") return false;
     const normalizedHost = normalizeAdblockHost(host);
     if (!normalizedHost) return false;
     const key = `${paneId}|${normalizedHost}`;
@@ -872,80 +872,6 @@ function registerIpc(): void {
   ipcMain.handle("session:clear", async () => {
     await Promise.all([...knownPartitions].map((partition) => session.fromPartition(partition).clearStorageData()));
     return true;
-  });
-}
-
-async function setupAdblock(): Promise<void> {
-  ipcMain.removeHandler("@ghostery/adblocker/inject-cosmetic-filters");
-  ipcMain.removeHandler("@ghostery/adblocker/is-mutation-observer-enabled");
-  ipcMain.handle("@ghostery/adblocker/inject-cosmetic-filters", async (event, url: unknown, message: unknown) => {
-    if (!blocker || typeof url !== "string") return;
-    const paneId = paneWebContents.get(event.sender.id);
-    const pageHost = paneId ? paneHosts.get(paneId) : undefined;
-    if (paneId && (isAdblockDisabledForUrl(paneId, url) || (pageHost !== undefined && isAdblockDisabledForHost(paneId, pageHost)))) return;
-    await blocker.onInjectCosmeticFilters(event, url, message as undefined | { classes: string[]; hrefs: string[]; ids: string[]; lifecycle: "start" | "dom-update" });
-  });
-  ipcMain.handle("@ghostery/adblocker/is-mutation-observer-enabled", () => Boolean(blocker?.config.enableMutationObserver));
-  try {
-    const cachePath = adblockCachePath();
-    blocker = await ElectronBlocker.fromLists(fetch, adsAndTrackingLists, {
-      enableMutationObserver: true,
-      loadExtendedSelectors: true,
-      loadCosmeticFilters: true,
-      loadGenericCosmeticsFilters: true,
-    }, {
-      path: cachePath,
-      read: async (value) => new Uint8Array(await fs.readFile(value)),
-      write: async (value, data) => {
-        await fs.mkdir(path.dirname(value), { recursive: true });
-        await fs.writeFile(value, data);
-      },
-    });
-    for (const partition of knownPartitions) installAdblockForSession(session.fromPartition(partition));
-  } catch (error) {
-    console.warn("Ad blocking rules could not be loaded:", error);
-  }
-}
-
-function installAdblockForSession(targetSession: Electron.Session): void {
-  installSessionDiagnostics(targetSession);
-  if (!blocker || installedBlockingSessions.has(targetSession)) return;
-  installedBlockingSessions.add(targetSession);
-  targetSession.webRequest.onBeforeRequest({ urls: ["<all_urls>"] }, (details, callback) => {
-    const paneId = typeof details.webContentsId === "number" ? paneWebContents.get(details.webContentsId) : undefined;
-    let host = "";
-    try {
-      host = new URL(details.url).hostname.toLowerCase();
-    } catch {
-      callback({});
-      return;
-    }
-    const pageHost = paneId ? paneHosts.get(paneId) : undefined;
-    if (shouldBypassAdblockForChallenge(details.url, details.resourceType, false)) {
-      callback({});
-      return;
-    }
-    if (paneId && (isAdblockDisabledForHost(paneId, host) || (pageHost !== undefined && isAdblockDisabledForHost(paneId, pageHost)))) {
-      callback({});
-      return;
-    }
-    if (paneId && isKnownAdRequest(details.url) && !isAdblockDisabledForUrl(paneId, details.url)) {
-      callback({ cancel: true });
-      return;
-    }
-    if (compatibilityResourceTypes.has(String(details.resourceType).toLowerCase())) {
-      callback({});
-      return;
-    }
-    if (isAuthenticationUrl(details.url)) {
-      callback({});
-      return;
-    }
-    if (isVideoRequest(details.url, details.resourceType, pageHost)) {
-      callback({});
-      return;
-    }
-    blocker?.onBeforeRequest(details, callback);
   });
 }
 
@@ -980,32 +906,11 @@ function installHeaderDiagnostics(targetSession: Electron.Session): void {
   });
 }
 
-function isVideoRequest(url: string, resourceType: string, pageHost?: string): boolean {
-  if (resourceType === "media" || resourceType === "object") return true;
-  if (/\.(?:m3u8|mp4|m4v|webm|mpd|m4s|ts|aac|m4a)(?:$|[?#])/i.test(url)) return true;
-  let requestHost = "";
-  try {
-    requestHost = new URL(url).hostname.toLowerCase();
-  } catch {
-    return false;
-  }
-  if (!pageHost) return false;
-  if (requestHost === pageHost || requestHost.endsWith(`.${pageHost}`)) return true;
-  const siteHosts = pageHost.includes("youtube")
-    ? ["youtube.com", "googlevideo.com", "ytimg.com", "googleusercontent.com"]
-    : pageHost.includes("bilibili")
-      ? ["bilibili.com", "bilivideo.com", "hdslb.com"]
-      : [];
-  return siteHosts.some((siteHost) => requestHost === siteHost || requestHost.endsWith(`.${siteHost}`));
-}
-
 function configureSession(targetSession: Electron.Session): void {
   installFingerprintForSession(targetSession);
   installHeaderDiagnostics(targetSession);
-  if (!installedCosmeticSessions.has(targetSession)) {
-    installedCosmeticSessions.add(targetSession);
-    targetSession.registerPreloadScript({ type: "frame", filePath: GHOSTERY_PRELOAD_PATH });
-  }
+  installSessionDiagnostics(targetSession);
+  adblockService.prepareSession(targetSession, ADBLOCK_PRELOAD_PATH);
 }
 
 function createWindow(): void {
@@ -1059,6 +964,7 @@ function createWindow(): void {
   mainWindow.webContents.on("will-attach-webview", (_event, webPreferences, params) => {
     webPreferences.preload = path.join(__dirname, "guest-preload.js");
     webPreferences.nodeIntegration = false;
+    webPreferences.nodeIntegrationInSubFrames = true;
     webPreferences.contextIsolation = true;
     webPreferences.sandbox = true;
     if (!isSafeUrl(params.src) && params.src !== "about:blank") params.src = "about:blank";
@@ -1083,14 +989,33 @@ function helperScriptPath(): string {
 }
 
 app.whenReady().then(async () => {
+  adblockService = new AdblockService({
+    engine: () => subscriptions?.engine ?? null,
+    enabled: (paneId, topUrl) => !isAdblockDisabledForUrl(paneId, topUrl),
+    notify: event => sendWindowMessage("adblock:blocked", event),
+    authenticate: (url, contents) => isAuthenticationUrl(url) && openAuthenticationWindow(url, panePartitions.get(paneWebContents.get(contents.id) ?? "")),
+    isAuthenticationUrl,
+    diagnostic: recordAdblockDiagnostic,
+  });
+  adblockService.registerIpc();
   registerIpc();
+  ipcMain.handle("adblock:status", () => subscriptions.status);
+  ipcMain.handle("adblock:allow", (event, paneId: unknown, id: unknown) => event.sender === mainWindow?.webContents && typeof paneId === "string" && typeof id === "string" && adblockService.allow(paneId, id));
   globalProxySettings = await loadGlobalProxySettings();
   await applyProxyToPartition("persist:shared", globalProxySettings).catch(() => undefined);
+  subscriptions = new AdblockSubscriptions({
+    bundledPath: app.isPackaged ? path.join(process.resourcesPath, "adblock-assets", "snapshot.json.gz") : path.join(app.getAppPath(), "electron", "adblock-assets", "snapshot.json.gz"),
+    cachePath: path.join(app.getPath("userData"), "adblock-rules-v1.json.gz"),
+    fetch: (url, options) => session.fromPartition("persist:shared").fetch(url, options),
+    changed: status => sendWindowMessage("adblock:status-changed", status),
+  });
+  await subscriptions.initialize();
   configureSession(session.fromPartition("persist:shared"));
   windowsHelper = new WindowsWindowHelper(helperScriptPath());
   windowsHelper.start();
   createWindow();
-  void setupAdblock();
+  void subscriptions.update();
+  adblockUpdateTimer = setInterval(() => void subscriptions.update(), UPDATE_INTERVAL);
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -1101,6 +1026,8 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  if (adblockUpdateTimer) clearInterval(adblockUpdateTimer);
+  adblockService?.dispose();
   windowsHelper?.stop();
   void chromeManager?.closeAll();
 });

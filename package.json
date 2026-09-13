@@ -1,6 +1,6 @@
 {
   "name": "same-screen-player",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A focused multi-pane video browser for watching streams side by side.",
   "private": true,
   "main": "dist-electron/electron/main.js",
@@ -11,14 +11,20 @@
     "test": "vitest run",
     "test:frame-controls": "npm run build && node scripts/verify-frame-controls.cjs",
     "test:watch": "vitest",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "adblock:update-snapshot": "node scripts/update-adblock-snapshot.cjs",
+    "test:adblock": "npm run build && node scripts/verify-adblock.cjs",
+    "test:video-sites": "npm run build && node scripts/verify-video-sites.cjs",
+    "test:playback-ui": "npm run build && node scripts/verify-playback-ui.cjs"
   },
   "dependencies": {
-    "@ghostery/adblocker": "^2.18.2",
-    "@ghostery/adblocker-electron": "^2.18.2",
-    "@ghostery/adblocker-electron-preload": "^2.18.2",
+    "@ghostery/adblocker": "2.18.2",
+    "@ghostery/adblocker-content": "2.18.2",
+    "@ghostery/adblocker-extended-selectors": "2.18.2",
+    "adblockpluscore": "0.11.1",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "tldts-experimental": "7.4.11",
     "ws": "^8.21.3"
   },
   "devDependencies": {
@@ -53,11 +59,16 @@
       {
         "from": "electron/windows-window-helper.ps1",
         "to": "windows-window-helper.ps1"
+      },
+      {
+        "from": "electron/adblock-assets",
+        "to": "adblock-assets"
       }
     ],
     "directories": {
       "output": "release"
     },
+    "artifactName": "same-screen-player-setup-${version}.${ext}",
     "mac": {
       "category": "public.app-category.video"
     },
@@ -71,6 +82,11 @@
       "target": [
         "nsis"
       ]
+    }
+  },
+  "overrides": {
+    "adblockpluscore": {
+      "tar": "7.5.22"
     }
   }
 }

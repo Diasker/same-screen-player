@@ -7,6 +7,10 @@ export function frameVideoBridgeScript(): string {
     const nativePause = HTMLMediaElement.prototype.pause;
     const boundVideos = new WeakSet();
     const childStates = new Map();
+    const documentId = crypto.randomUUID?.() || Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const playerIds = new WeakMap();
+    const muteSequences = new WeakMap();
+    let nextPlayerId = 0;
     let lastState = "";
     let lastSentAt = 0;
     let commandVersion = 0;
@@ -85,7 +89,7 @@ export function frameVideoBridgeScript(): string {
       };
     }
 
-    function publish(force) {
+    function publish(force, nativeMuteIntent = false) {
       const state = snapshot();
       if (!state.hasVideo) {
         lastState = "";
@@ -96,13 +100,21 @@ export function frameVideoBridgeScript(): string {
       if (!force && serialized === lastState && now - lastSentAt < 1000) return;
       lastState = serialized;
       lastSentAt = now;
-      window.parent.postMessage({ source, kind: "state", state }, "*");
+      const video = pickVideo();
+      window.parent.postMessage({ source, kind: "state", state, playerId: playerId(video), muteSequence: muteSequences.get(video) || 0, nativeMuteIntent }, "*");
+    }
+
+    function playerId(video) {
+      if (!video) return "";
+      if (!playerIds.has(video)) playerIds.set(video, documentId + "/" + (++nextPlayerId));
+      return playerIds.get(video);
     }
 
     function attach(video) {
       if (boundVideos.has(video)) return;
       boundVideos.add(video);
-      ["durationchange", "progress", "timeupdate", "volumechange", "ratechange", "loadedmetadata", "canplay", "pause", "ended"].forEach((eventName) => video.addEventListener(eventName, () => publish(true)));
+      ["durationchange", "progress", "timeupdate", "ratechange", "loadedmetadata", "canplay", "pause", "ended"].forEach((eventName) => video.addEventListener(eventName, () => publish(true)));
+      video.addEventListener("volumechange", () => publish(true, Date.now() - lastFrameInteractionAt < 900));
       video.addEventListener("play", () => {
         if (pauseLocked && Date.now() - lastFrameInteractionAt >= 900) pauseVideo(video, commandVersion);
         publish(true);
@@ -171,8 +183,8 @@ export function frameVideoBridgeScript(): string {
     function playVideo(video, version) {
       try {
         const pending = nativePlay.call(video);
-        pending?.catch(() => {
-          if (version !== commandVersion || !video.paused) return;
+        pending?.catch((error) => {
+          if (error?.name !== "NotAllowedError" || version !== commandVersion || !video.paused || video.muted) return;
           video.muted = true;
           void nativePlay.call(video).catch(() => undefined);
         });
@@ -237,6 +249,14 @@ export function frameVideoBridgeScript(): string {
       const version = commandVersion;
       const videos = collectVideos(document);
       const video = pickVideo();
+      if (command.targetPlayerId && command.targetPlayerId !== playerId(video)) {
+        forwardCommand(command);
+        return;
+      }
+      if (Number.isSafeInteger(command.muteSequence) && video) {
+        if (command.muteSequence <= (muteSequences.get(video) || 0)) return;
+        muteSequences.set(video, command.muteSequence);
+      }
       const localPlaying = videos.some((candidate) => !candidate.paused && !candidate.ended);
       try {
         if (command.type === "play") {
@@ -258,11 +278,14 @@ export function frameVideoBridgeScript(): string {
           forwardCommand(action);
         } else {
           if (command.type === "seek" && Number.isFinite(command.value) && video) video.currentTime = Math.max(0, command.value);
-          else if (command.type === "setVolume" && Number.isFinite(command.value) && video) video.volume = Math.min(1, Math.max(0, command.value));
+          else if (command.type === "setVolume" && Number.isFinite(command.value) && video) {
+            video.volume = Math.min(1, Math.max(0, command.value));
+            if (command.value > 0) video.muted = false;
+          }
           else if (command.type === "toggleMuted" && video) video.muted = !video.muted;
           else if (command.type === "setMuted" && typeof command.value === "boolean" && video) video.muted = command.value;
           else if (command.type === "setRate" && Number.isFinite(command.value) && video) video.playbackRate = Math.min(4, Math.max(0.25, command.value));
-          forwardCommand(command);
+          if (!command.targetPlayerId) forwardCommand(command);
         }
       } catch {
       }
@@ -285,6 +308,7 @@ export function frameVideoBridgeScript(): string {
     });
     function start() {
       window.addEventListener("pointerdown", () => { lastFrameInteractionAt = Date.now(); if (pauseLocked) pauseLocked = false; }, true);
+      window.addEventListener("keydown", () => { lastFrameInteractionAt = Date.now(); }, true);
       scan();
       const observer = new MutationObserver(scan);
       observer.observe(document.documentElement, { childList: true, subtree: true });

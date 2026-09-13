@@ -1,4 +1,5 @@
 /// <reference types="vite/client" />
+import type { AdblockStatus, BlockedNavigation } from "./shared/adblock";
 
 interface DesktopApi {
   guestPreloadUrl: string;
@@ -25,6 +26,10 @@ interface DesktopApi {
   exitWebpageFullscreen: (paneId?: string) => Promise<boolean>;
   setAdblock: (paneId: string, host: string, enabled: boolean) => Promise<boolean>;
   getAdblock: (paneId: string, host: string) => Promise<boolean>;
+  getAdblockStatus: () => Promise<AdblockStatus>;
+  allowBlockedNavigation: (paneId: string, id: string) => Promise<boolean>;
+  onAdblockBlocked: (callback: (event: BlockedNavigation) => void) => () => void;
+  onAdblockStatus: (callback: (status: AdblockStatus) => void) => () => void;
   setChallengeMode: (paneId: string, enabled: boolean) => Promise<boolean>;
   reportChallengeState: (paneId: string, state: unknown) => Promise<boolean>;
   inspectFingerprint: (paneId: string) => Promise<unknown>;
