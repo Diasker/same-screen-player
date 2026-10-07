@@ -870,7 +870,7 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
           <div className="proxy-form-actions"><button className="icon-button" onClick={() => setProxyEditorOpen(false)}>取消</button><button className="icon-button primary" onClick={savePaneProxy}>保存</button></div>
         </div>
       )}
-      {popupNotice && <div className="pane-popup-notice" role="status" onPointerDown={event => event.stopPropagation()}>
+      {props.debugOverlays && popupNotice && <div className="pane-popup-notice" role="status" onPointerDown={event => event.stopPropagation()}>
         <span>已阻止 {popupNotice.host}：{popupNotice.reason === "rule" ? "广告规则命中" : popupNotice.reason === "playback" ? "播放附带跳转" : "未确认用途的跳转"}</span>
         {popupNotice.canAllow && <button className="icon-button" onClick={() => {
           void window.desktop.allowBlockedNavigation(runtime.paneId, popupNotice.id).then(ok => {
