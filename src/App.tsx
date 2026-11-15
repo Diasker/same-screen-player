@@ -33,6 +33,12 @@ import {
 import { resolveEscapeAction, toggleInteractionMode } from "./shared/interaction";
 import { shouldShowPaneNotice } from "./shared/debug-overlays";
 import { httpLoadError, networkLoadError, samePageUrl, playbackResolvesHttpError, type PageLoadError } from "./shared/load-errors";
+import {
+  formatBytes,
+  type DownloadProbeResult,
+  type DownloadStateSnapshot,
+  type DownloadTask,
+} from "./shared/downloads";
 
 type WebviewElement = HTMLElement & {
   loadURL: (url: string) => Promise<void>;
@@ -182,12 +188,14 @@ type PaneViewProps = {
   runtime: PaneRuntime;
   active: boolean;
   guestPreloadUrl: string;
+  paneDownloadProgress: number | null;
   onActive: () => void;
   onNavigate: (value: string) => void;
   onUpdate: (patch: Partial<PaneRuntime>) => void;
   onSplit: (orientation: Orientation) => void;
   onRemove: () => void;
   onOpenChrome: () => void;
+  onDownload: () => void;
   onProxyChange: (settings: PaneProxySettings) => void;
   interactionMode: InteractionMode;
   debugOverlays: boolean;
@@ -830,6 +838,14 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
           <div className="pane-actions">
             <button className="icon-button" onClick={reloadPane}>刷新</button>
             <button className="icon-button" onClick={() => void selectLocalVideo()}>本地视频</button>
+            {!isLocalVideo && runtime.url && (
+              <button
+                className={`icon-button pane-download-button ${props.paneDownloadProgress !== null ? "selected" : ""}`}
+                onClick={props.onDownload}
+              >
+                {props.paneDownloadProgress === null ? "下载" : props.paneDownloadProgress < 0 ? "下载中" : `下载 ${props.paneDownloadProgress}%`}
+              </button>
+            )}
             {!isLocalVideo && <button className={`icon-button ${runtime.adblockEnabled ? "selected" : "warning"}`} onClick={() => void toggleAdblock()}>{runtime.adblockEnabled ? "拦截" : "放行"}</button>}
             <button className="icon-button" onClick={() => props.onSplit("horizontal")}>左右分屏</button>
             <button className="icon-button" onClick={() => props.onSplit("vertical")}>上下分屏</button>
@@ -893,6 +909,7 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
 }, (previous, next) => (
   previous.runtime === next.runtime
   && previous.active === next.active
+  && previous.paneDownloadProgress === next.paneDownloadProgress
   && previous.interactionMode === next.interactionMode
   && previous.debugOverlays === next.debugOverlays
   && previous.guestPreloadUrl === next.guestPreloadUrl
@@ -925,6 +942,7 @@ type LayoutSurfaceProps = {
   runtimes: Record<string, PaneRuntime>;
   activePaneId: string;
   guestPreloadUrl: string;
+  activeDownloadProgressByPane: Record<string, number | null>;
   onActive: (paneId: string) => void;
   onNavigate: (paneId: string, value: string) => void;
   onUpdatePane: (paneId: string, patch: Partial<PaneRuntime>) => void;
@@ -934,6 +952,7 @@ type LayoutSurfaceProps = {
   onSplit: (paneId: string, orientation: Orientation) => void;
   onRemove: (paneId: string) => void;
   onOpenChrome: (paneId: string) => void;
+  onDownloadPane: (paneId: string) => void;
   interactionMode: InteractionMode;
   debugOverlays: boolean;
 };
@@ -1032,7 +1051,7 @@ function LayoutSurface(props: LayoutSurfaceProps): ReactElement {
         const runtime = props.runtimes[rect.paneId] ?? makeRuntime(rect.paneId);
         const isDragged = dragState?.paneId === rect.paneId && dragState.dragging;
         const isDropTarget = dragState?.targetPaneId === rect.paneId;
-        return <div key={rect.paneId} ref={(element) => { if (element) paneRefs.current.set(rect.paneId, element); else paneRefs.current.delete(rect.paneId); }} className={`layout-pane ${isDragged ? "is-dragging" : ""} ${isDropTarget ? "is-drop-target" : ""}`} style={{ left: `${rect.left * 100}%`, top: `${rect.top * 100}%`, width: `${rect.width * 100}%`, height: `${rect.height * 100}%`, transform: isDragged ? `translate(${dragState.offsetX}px, ${dragState.offsetY}px)` : undefined }} onPointerDown={(event) => startDrag(event, rect.paneId)} onPointerMove={updateDrag} onPointerUp={finishDrag} onPointerCancel={finishDrag} onContextMenu={(event) => showContextMenu(event, rect.paneId)}><PaneView runtime={runtime} active={props.activePaneId === rect.paneId} interactionMode={props.interactionMode} debugOverlays={props.debugOverlays} guestPreloadUrl={props.guestPreloadUrl} onActive={() => props.onActive(rect.paneId)} onNavigate={(value) => props.onNavigate(rect.paneId, value)} onUpdate={(patch) => props.onUpdatePane(rect.paneId, patch)} onProxyChange={(settings) => props.onProxyChange(rect.paneId, settings)} onSplit={(orientation) => props.onSplit(rect.paneId, orientation)} onRemove={() => props.onRemove(rect.paneId)} onOpenChrome={() => props.onOpenChrome(rect.paneId)} /></div>;
+        return <div key={rect.paneId} ref={(element) => { if (element) paneRefs.current.set(rect.paneId, element); else paneRefs.current.delete(rect.paneId); }} className={`layout-pane ${isDragged ? "is-dragging" : ""} ${isDropTarget ? "is-drop-target" : ""}`} style={{ left: `${rect.left * 100}%`, top: `${rect.top * 100}%`, width: `${rect.width * 100}%`, height: `${rect.height * 100}%`, transform: isDragged ? `translate(${dragState.offsetX}px, ${dragState.offsetY}px)` : undefined }} onPointerDown={(event) => startDrag(event, rect.paneId)} onPointerMove={updateDrag} onPointerUp={finishDrag} onPointerCancel={finishDrag} onContextMenu={(event) => showContextMenu(event, rect.paneId)}><PaneView runtime={runtime} active={props.activePaneId === rect.paneId} paneDownloadProgress={props.activeDownloadProgressByPane[rect.paneId] ?? null} interactionMode={props.interactionMode} debugOverlays={props.debugOverlays} guestPreloadUrl={props.guestPreloadUrl} onActive={() => props.onActive(rect.paneId)} onNavigate={(value) => props.onNavigate(rect.paneId, value)} onUpdate={(patch) => props.onUpdatePane(rect.paneId, patch)} onProxyChange={(settings) => props.onProxyChange(rect.paneId, settings)} onSplit={(orientation) => props.onSplit(rect.paneId, orientation)} onRemove={() => props.onRemove(rect.paneId)} onOpenChrome={() => props.onOpenChrome(rect.paneId)} onDownload={() => props.onDownloadPane(rect.paneId)} /></div>;
       })}
       {geometry.dividers.map((divider) => <LayoutDivider key={divider.path.join(".")} divider={divider} onResize={props.onResize} />)}
       {contextMenu && <div className="pane-context-menu" style={{ left: contextMenu.left, top: contextMenu.top }} role="menu"><button type="button" role="menuitem" className="pane-context-action" disabled={geometry.panes.length <= 1} onClick={() => { setContextMenu(null); props.onRemove(contextMenu.paneId); }}>关闭当前分屏</button></div>}
@@ -1065,6 +1084,33 @@ function proxyModeLabel(mode: string): string {
   return "系统代理";
 }
 
+function isActiveDownloadTask(task: DownloadTask): boolean {
+  return task.status === "queued" || task.status === "downloading" || task.status === "merging";
+}
+
+function formatTaskStatusText(task: DownloadTask): string {
+  if (task.status === "queued") return "准备中…";
+  if (task.status === "merging") return "正在合并音视频…";
+  if (task.status === "completed") {
+    return task.totalBytes ? `已完成 · ${formatBytes(task.totalBytes)}` : "已完成";
+  }
+  if (task.status === "canceled") return "已取消";
+  if (task.status === "failed") return task.error || "下载失败";
+  const parts: string[] = [];
+  if (task.progress !== null) parts.push(`${task.progress.toFixed(1)}%`);
+  if (task.totalBytes) parts.push(`${formatBytes(task.downloadedBytes)} / ${formatBytes(task.totalBytes)}`);
+  else if (task.downloadedBytes > 0) parts.push(formatBytes(task.downloadedBytes));
+  if (task.speedText) parts.push(task.speedText);
+  if (task.etaText) parts.push(`剩余 ${task.etaText}`);
+  return parts.join(" · ") || "下载中…";
+}
+
+type ProbeUiState =
+  | { status: "idle" }
+  | { status: "probing"; probeId: string; paneId: string }
+  | { status: "ready"; result: Extract<DownloadProbeResult, { ok: true }> }
+  | { status: "error"; result: Extract<DownloadProbeResult, { ok: false }> };
+
 export default function App(): ReactElement {
   const [layout, setLayout] = useState<LayoutNode>(() => createPreset("single"));
   const [runtimes, setRuntimes] = useState<Record<string, PaneRuntime>>({ "pane-1": makeRuntime("pane-1") });
@@ -1080,6 +1126,16 @@ export default function App(): ReactElement {
   const [globalProxyDraft, setGlobalProxyDraft] = useState<GlobalProxySettings>(() => defaultGlobalProxySettings());
   const [globalProxyOpen, setGlobalProxyOpen] = useState(false);
   const [globalProxyError, setGlobalProxyError] = useState<string | null>(null);
+  const [downloadState, setDownloadState] = useState<DownloadStateSnapshot | null>(null);
+  const [downloadPopoverOpen, setDownloadPopoverOpen] = useState(false);
+  const [downloadTargetPaneId, setDownloadTargetPaneId] = useState("pane-1");
+  const [probeState, setProbeState] = useState<ProbeUiState>({ status: "idle" });
+  const [downloadFileName, setDownloadFileName] = useState("");
+  const [selectedQualityId, setSelectedQualityId] = useState("best");
+  const [downloadFormError, setDownloadFormError] = useState<string | null>(null);
+  const activeProbeIdRef = useRef<string | null>(null);
+  const prevToolsAvailabilityRef = useRef<{ ytDlp: boolean; ffmpeg: boolean } | null>(null);
+  const prevTaskStatusesRef = useRef<Map<string, DownloadTask["status"]>>(new Map());
   const [debugOverlays, setDebugOverlays] = useState(import.meta.env.DEV);
   const paneIds = useMemo(() => getPaneIds(layout), [layout]);
 
@@ -1158,6 +1214,61 @@ export default function App(): ReactElement {
       document.removeEventListener("keydown", closeOnEscape, true);
     };
   }, [globalProxyOpen]);
+
+  useEffect(() => {
+    let disposed = false;
+    void window.desktop.getDownloadState().then((snapshot) => {
+      if (!disposed && snapshot) setDownloadState(snapshot);
+    }).catch(() => undefined);
+    const unsubscribe = window.desktop.onDownloadStateChanged((snapshot) => {
+      if (!disposed) setDownloadState(snapshot);
+    });
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!downloadState) return;
+    const prev = prevTaskStatusesRef.current;
+    const next = new Map<string, DownloadTask["status"]>();
+    for (const task of downloadState.tasks) {
+      next.set(task.id, task.status);
+      const oldStatus = prev.get(task.id);
+      if (oldStatus !== task.status) {
+        if (oldStatus === undefined && isActiveDownloadTask(task)) {
+          setStatus(`开始下载：${task.fileName}`);
+        } else if (task.status === "completed" && oldStatus !== undefined) {
+          setStatus(`下载完成：${task.fileName}`);
+        } else if (task.status === "failed" && oldStatus !== undefined) {
+          setStatus(`下载失败：${task.error || task.fileName}`);
+        }
+      }
+    }
+    prevTaskStatusesRef.current = next;
+  }, [downloadState]);
+
+  useEffect(() => {
+    if (!downloadPopoverOpen) return;
+    const close = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof HTMLElement && target.closest(".download-popover, .download-button, .pane-download-button")) return;
+      setDownloadPopoverOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        setDownloadPopoverOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", close, true);
+    document.addEventListener("keydown", closeOnEscape, true);
+    return () => {
+      document.removeEventListener("pointerdown", close, true);
+      document.removeEventListener("keydown", closeOnEscape, true);
+    };
+  }, [downloadPopoverOpen]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1317,15 +1428,357 @@ export default function App(): ReactElement {
   const openGlobalProxyEditor = () => {
     setGlobalProxyDraft({ ...globalProxy, custom: { ...globalProxy.custom } });
     setGlobalProxyError(null);
+    setDownloadPopoverOpen(false);
     setGlobalProxyOpen((current) => !current);
   };
 
+  const startProbe = useCallback(async (paneId: string) => {
+    if (activeProbeIdRef.current) {
+      void window.desktop.cancelProbeDownload(activeProbeIdRef.current).catch(() => undefined);
+    }
+    const probeId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    activeProbeIdRef.current = probeId;
+    setDownloadTargetPaneId(paneId);
+    setDownloadFormError(null);
+    setProbeState({ status: "probing", probeId, paneId });
+    try {
+      const result = await window.desktop.probePaneDownload(probeId, paneId);
+      if (activeProbeIdRef.current !== probeId) return;
+      activeProbeIdRef.current = null;
+      if (result.ok) {
+        setProbeState({ status: "ready", result });
+        setDownloadFileName(result.suggestedName);
+        setSelectedQualityId(result.qualities[0]?.id ?? "best");
+      } else if (result.code === "canceled") {
+        setProbeState({ status: "idle" });
+      } else {
+        setProbeState({ status: "error", result });
+      }
+    } catch (error) {
+      if (activeProbeIdRef.current !== probeId) return;
+      activeProbeIdRef.current = null;
+      setProbeState({
+        status: "error",
+        result: {
+          ok: false,
+          code: "failed",
+          message: error instanceof Error ? error.message : "解析视频信息失败",
+          paneId,
+          hasYtDlp: downloadState?.tools.ytDlp.available ?? false,
+          hasFfmpeg: downloadState?.tools.ffmpeg.available ?? false,
+        },
+      });
+    }
+  }, [downloadState?.tools.ffmpeg.available, downloadState?.tools.ytDlp.available]);
+
+  const cancelCurrentProbe = useCallback(() => {
+    if (activeProbeIdRef.current) {
+      void window.desktop.cancelProbeDownload(activeProbeIdRef.current).catch(() => undefined);
+      activeProbeIdRef.current = null;
+    }
+    setProbeState({ status: "idle" });
+  }, []);
+
+  useEffect(() => {
+    const tools = downloadState?.tools;
+    if (!tools) return;
+    const prev = prevToolsAvailabilityRef.current;
+    const curr = { ytDlp: tools.ytDlp.available, ffmpeg: tools.ffmpeg.available };
+    prevToolsAvailabilityRef.current = curr;
+    if (!prev || !downloadPopoverOpen) return;
+    const ytNewlyReady = !prev.ytDlp && curr.ytDlp;
+    const ffNewlyReady = !prev.ffmpeg && curr.ffmpeg;
+    if (ytNewlyReady && probeState.status === "error" && probeState.result.code === "missing-yt-dlp") {
+      const paneRuntime = runtimes[downloadTargetPaneId];
+      if (paneRuntime?.mediaSource === "network" && paneRuntime.url) void startProbe(downloadTargetPaneId);
+    } else if (ffNewlyReady && probeState.status === "ready" && !probeState.result.hasFfmpeg) {
+      void startProbe(probeState.result.paneId);
+    }
+  }, [downloadPopoverOpen, downloadState?.tools, downloadTargetPaneId, probeState, runtimes, startProbe]);
+
+  const openPaneDownload = useCallback((paneId: string) => {
+    setGlobalProxyOpen(false);
+    setDownloadPopoverOpen(true);
+    setDownloadTargetPaneId(paneId);
+    const runtime = runtimes[paneId];
+    if (runtime?.mediaSource === "network" && runtime.url) {
+      void startProbe(paneId);
+    } else {
+      setProbeState({ status: "idle" });
+    }
+  }, [runtimes, startProbe]);
+
+  const toggleHeaderDownloadPopover = () => {
+    setGlobalProxyOpen(false);
+    setDownloadPopoverOpen((current) => {
+      const next = !current;
+      if (next) {
+        const targetId = activePaneId || paneIds[0] || "pane-1";
+        setDownloadTargetPaneId(targetId);
+        const runtime = runtimes[targetId];
+        if (runtime?.mediaSource === "network" && runtime.url) {
+          const alreadyReadyForSamePane =
+            (probeState.status === "ready" && probeState.result.paneId === targetId && probeState.result.pageUrl === runtime.url)
+            || (probeState.status === "probing" && probeState.paneId === targetId);
+          if (!alreadyReadyForSamePane) void startProbe(targetId);
+        } else {
+          setProbeState({ status: "idle" });
+        }
+      }
+      return next;
+    });
+  };
+
+  const handleStartDownload = async () => {
+    if (probeState.status !== "ready") return;
+    const quality = probeState.result.qualities.find((item) => item.id === selectedQualityId) ?? probeState.result.qualities[0];
+    if (!quality) return;
+    setDownloadFormError(null);
+    const response = await window.desktop.startDownload({
+      paneId: probeState.result.paneId,
+      pageUrl: probeState.result.pageUrl,
+      probeUrl: probeState.result.probeUrl,
+      sourceType: probeState.result.sourceType,
+      directUrl: probeState.result.directUrl,
+      fileName: downloadFileName.trim() || probeState.result.suggestedName,
+      qualityId: quality.id,
+      selector: quality.selector,
+      qualityLabel: quality.label,
+      ext: quality.ext,
+      isAudioOnly: quality.isAudioOnly,
+    });
+    if (!response.ok) {
+      setDownloadFormError(response.message);
+    }
+  };
+
+  const activeDownloadProgressByPane = useMemo(() => {
+    const map: Record<string, number | null> = {};
+    if (!downloadState) return map;
+    for (const task of downloadState.tasks) {
+      if (!task.paneId || !isActiveDownloadTask(task)) continue;
+      if (map[task.paneId] !== undefined) continue;
+      if (task.status === "merging") map[task.paneId] = 100;
+      else if (task.progress !== null) map[task.paneId] = Math.round(task.progress);
+      else map[task.paneId] = -1;
+    }
+    return map;
+  }, [downloadState]);
+
+  const activeTasks = useMemo(
+    () => (downloadState?.tasks ?? []).filter(isActiveDownloadTask),
+    [downloadState]
+  );
+
+  const headerDownloadLabel = useMemo(() => {
+    if (activeTasks.length === 0) return "下载";
+    if (activeTasks.length === 1) {
+      const task = activeTasks[0];
+      if (task.status === "merging") return "合并中…";
+      if (task.progress !== null) return `下载 ${Math.round(task.progress)}%`;
+      return "下载中";
+    }
+    return `下载中 (${activeTasks.length})`;
+  }, [activeTasks]);
+
+  const targetPaneRuntime = runtimes[downloadTargetPaneId];
+  const targetPaneHasNetworkVideo = Boolean(targetPaneRuntime && targetPaneRuntime.mediaSource === "network" && targetPaneRuntime.url);
+  const selectedQuality = probeState.status === "ready"
+    ? (probeState.result.qualities.find((item) => item.id === selectedQualityId) ?? probeState.result.qualities[0])
+    : undefined;
+  const hasFinishedTasks = Boolean(downloadState?.tasks.some((task) => !isActiveDownloadTask(task)));
+
   return (
     <div className={`app-shell ${fullscreen ? "is-fullscreen" : ""} ${htmlFullscreen ? "is-html-fullscreen" : ""} ${interactionMode === "app" ? "is-app-input-mode" : "is-web-input-mode"}`} style={{ "--app-font-scale": fontScale } as CSSProperties}>
-       <header className="app-header"><div className="brand"><div className="brand-mark">▦</div><div><div className="brand-title">同屏播放</div><div className="brand-subtitle">沉浸式多视频工作台</div></div></div><div className="header-actions"><span className={`interaction-mode ${interactionMode}`}>{interactionMode === "web" ? "网页操作" : "应用操作"}</span><button className="header-button" onClick={toggleInputMode}>{interactionMode === "web" ? "切到应用层" : "切回网页层"} · F8</button><button className={`header-button proxy-button ${globalProxy.mode === "custom" ? "selected" : ""}`} onClick={openGlobalProxyEditor}>代理：{proxyModeLabel(globalProxy.mode)}</button><label className="font-scale-control"><span>字号</span><select aria-label="应用字号" value={fontScale} onChange={(event) => setFontScale(Number(event.target.value))}>{FONT_SCALE_OPTIONS.map((value) => <option key={value} value={value}>{Math.round(value * 100)}%</option>)}</select></label><span className="pane-count">{paneIds.length}/{MAX_PANES} 格</span><button className="header-button" onClick={() => void toggleFullscreen()}>{fullscreen ? "退出全屏" : "全屏"}</button><button className="header-button" onClick={() => void save()}>保存布局</button><button className="header-button subtle" onClick={() => void clearSession()}>清除登录</button></div>{globalProxyOpen && <div className="proxy-popover global-proxy-popover" onPointerDown={(event) => event.stopPropagation()} role="dialog" aria-label="全局代理设置"><div className="proxy-popover-title">全局代理设置</div><div className="proxy-form-hint">仅影响 Electron 内嵌分屏，不改变外部 Chrome 的网络设置。</div><label className="proxy-mode-field">代理模式<select value={globalProxyDraft.mode} onChange={(event) => setGlobalProxyDraft((current) => ({ ...current, mode: event.target.value as GlobalProxySettings["mode"] }))}><option value="system">系统代理</option><option value="direct">直连（不使用代理）</option><option value="custom">自定义 HTTP</option></select></label>{globalProxyDraft.mode === "custom" && <><label className="proxy-checkbox"><input type="checkbox" checked={globalProxyDraft.mode === "custom"} onChange={(event) => setGlobalProxyDraft((current) => ({ ...current, mode: event.target.checked ? "custom" : "direct" }))} />使用代理服务器</label><ProxyEndpointFields value={globalProxyDraft.custom} onChange={(custom) => setGlobalProxyDraft((current) => ({ ...current, custom }))} /></>}{globalProxyError && <div className="proxy-form-error">{globalProxyError}</div>}<div className="proxy-form-actions"><button className="icon-button" onClick={() => { setGlobalProxyOpen(false); setGlobalProxyError(null); }}>取消</button><button className="icon-button primary" onClick={() => void saveGlobalProxy()}>保存</button></div></div>}</header>
+       <header className="app-header"><div className="brand"><div className="brand-mark">▦</div><div><div className="brand-title">同屏播放</div><div className="brand-subtitle">沉浸式多视频工作台</div></div></div><div className="header-actions"><span className={`interaction-mode ${interactionMode}`}>{interactionMode === "web" ? "网页操作" : "应用操作"}</span><button className="header-button" onClick={toggleInputMode}>{interactionMode === "web" ? "切到应用层" : "切回网页层"} · F8</button><button className={`header-button download-button ${activeTasks.length > 0 || downloadPopoverOpen ? "selected" : ""}`} onClick={toggleHeaderDownloadPopover}>{headerDownloadLabel}</button><button className={`header-button proxy-button ${globalProxy.mode === "custom" ? "selected" : ""}`} onClick={openGlobalProxyEditor}>代理：{proxyModeLabel(globalProxy.mode)}</button><label className="font-scale-control"><span>字号</span><select aria-label="应用字号" value={fontScale} onChange={(event) => setFontScale(Number(event.target.value))}>{FONT_SCALE_OPTIONS.map((value) => <option key={value} value={value}>{Math.round(value * 100)}%</option>)}</select></label><span className="pane-count">{paneIds.length}/{MAX_PANES} 格</span><button className="header-button" onClick={() => void toggleFullscreen()}>{fullscreen ? "退出全屏" : "全屏"}</button><button className="header-button" onClick={() => void save()}>保存布局</button><button className="header-button subtle" onClick={() => void clearSession()}>清除登录</button></div>{globalProxyOpen && <div className="proxy-popover global-proxy-popover" onPointerDown={(event) => event.stopPropagation()} role="dialog" aria-label="全局代理设置"><div className="proxy-popover-title">全局代理设置</div><div className="proxy-form-hint">仅影响 Electron 内嵌分屏，不改变外部 Chrome 的网络设置。</div><label className="proxy-mode-field">代理模式<select value={globalProxyDraft.mode} onChange={(event) => setGlobalProxyDraft((current) => ({ ...current, mode: event.target.value as GlobalProxySettings["mode"] }))}><option value="system">系统代理</option><option value="direct">直连（不使用代理）</option><option value="custom">自定义 HTTP</option></select></label>{globalProxyDraft.mode === "custom" && <><label className="proxy-checkbox"><input type="checkbox" checked={globalProxyDraft.mode === "custom"} onChange={(event) => setGlobalProxyDraft((current) => ({ ...current, mode: event.target.checked ? "custom" : "direct" }))} />使用代理服务器</label><ProxyEndpointFields value={globalProxyDraft.custom} onChange={(custom) => setGlobalProxyDraft((current) => ({ ...current, custom }))} /></>}{globalProxyError && <div className="proxy-form-error">{globalProxyError}</div>}<div className="proxy-form-actions"><button className="icon-button" onClick={() => { setGlobalProxyOpen(false); setGlobalProxyError(null); }}>取消</button><button className="icon-button primary" onClick={() => void saveGlobalProxy()}>保存</button></div></div>}</header>
        <div className="toolbar"><span className="toolbar-label">布局</span><div className="preset-group">{(["single", "split-2", "split-3", "grid-2x2", "grid-3x2"] as Preset[]).map((preset) => <button key={preset} className="preset-button" onClick={() => applyPreset(preset)}>{presetLabel(preset)}</button>)}</div><div className="toolbar-hint">{interactionMode === "web" ? "网页播放器直接接收鼠标和键盘 · F8 切换应用层" : "应用层接管活动分屏 · 鼠标移到底部显示控制"}</div></div>
-       <main className="workspace">{guestPreloadUrl ? <LayoutSurface layout={layout} runtimes={runtimes} activePaneId={activePaneId} interactionMode={interactionMode} debugOverlays={debugOverlays} guestPreloadUrl={guestPreloadUrl} onActive={setActivePaneId} onNavigate={navigate} onUpdatePane={updatePane} onProxyChange={updatePaneProxy} onResize={resizeDivider} onSwap={swapPanes} onSplit={split} onRemove={closePane} onOpenChrome={(paneId) => void openChrome(paneId)} /> : <div className="loading-state">正在准备网页播放内核…</div>}</main>
+       <main className="workspace">{guestPreloadUrl ? <LayoutSurface layout={layout} runtimes={runtimes} activePaneId={activePaneId} activeDownloadProgressByPane={activeDownloadProgressByPane} interactionMode={interactionMode} debugOverlays={debugOverlays} guestPreloadUrl={guestPreloadUrl} onActive={setActivePaneId} onNavigate={navigate} onUpdatePane={updatePane} onProxyChange={updatePaneProxy} onResize={resizeDivider} onSwap={swapPanes} onSplit={split} onRemove={closePane} onOpenChrome={(paneId) => void openChrome(paneId)} onDownloadPane={openPaneDownload} /> : <div className="loading-state">正在准备网页播放内核…</div>}</main>
        <footer className="status-bar"><span className="status-dot" /><span>{status}</span><span className="status-spacer" /><span>全局代理：{proxyModeLabel(globalProxy.mode)} · 共享会话 · 安全拦截</span></footer>
+      {downloadPopoverOpen && (
+        <div
+          className={`proxy-popover download-popover ${fullscreen || htmlFullscreen ? "in-fullscreen" : ""}`}
+          onPointerDown={(event) => event.stopPropagation()}
+          role="dialog"
+          aria-label="视频下载"
+        >
+          <div className="download-popover-header">
+            <div className="proxy-popover-title">视频下载</div>
+            <button className="icon-button" aria-label="关闭下载面板" onClick={() => setDownloadPopoverOpen(false)}>关闭</button>
+          </div>
+          <div className="download-section">
+            <div className="download-target-row">
+              <span className="download-target-label">
+                当前分屏：{targetPaneHasNetworkVideo ? (targetPaneRuntime?.url || "") : "暂无网页视频"}
+              </span>
+              {targetPaneHasNetworkVideo && (
+                <button
+                  className="icon-button"
+                  disabled={probeState.status === "probing"}
+                  onClick={() => void startProbe(downloadTargetPaneId)}
+                >
+                  {probeState.status === "probing" ? "解析中…" : "重新解析"}
+                </button>
+              )}
+            </div>
+            {probeState.status === "probing" && (
+              <div className="download-probe-box">
+                <span>正在解析视频信息与可用清晰度…</span>
+                <button className="icon-button" onClick={cancelCurrentProbe}>取消</button>
+              </div>
+            )}
+            {probeState.status === "ready" && (
+              <div className="download-ready-box">
+                <div className="download-video-title" title={probeState.result.title}>
+                  {probeState.result.title}
+                  {typeof probeState.result.duration === "number" && probeState.result.duration > 0 && ` · ${formatTime(probeState.result.duration)}`}
+                </div>
+                <label className="download-field">
+                  保存名称
+                  <div className="download-name-row">
+                    <input
+                      aria-label="保存文件名"
+                      value={downloadFileName}
+                      onChange={(event) => setDownloadFileName(event.target.value)}
+                      placeholder={probeState.result.suggestedName}
+                    />
+                    <span className="download-ext-badge">.{selectedQuality?.ext || "mp4"}</span>
+                  </div>
+                </label>
+                <label className="download-field">
+                  清晰度
+                  <select
+                    aria-label="下载清晰度"
+                    value={selectedQualityId}
+                    onChange={(event) => setSelectedQualityId(event.target.value)}
+                  >
+                    {probeState.result.qualities.map((option) => (
+                      <option key={option.id} value={option.id}>{option.label}</option>
+                    ))}
+                  </select>
+                </label>
+                {selectedQuality?.needsFfmpeg && (
+                  <div className="proxy-form-hint warning">
+                    此清晰度需要 ffmpeg 合并音视频轨；建议下方安装组件，或改选不带合并提示的画质。
+                  </div>
+                )}
+                {downloadFormError && <div className="proxy-form-error">{downloadFormError}</div>}
+                <div className="download-start-row">
+                  <button className="icon-button primary" onClick={() => void handleStartDownload()}>开始下载</button>
+                </div>
+              </div>
+            )}
+            {probeState.status === "error" && (
+              <div className="download-error-box">{probeState.result.message}</div>
+            )}
+          </div>
+
+          {downloadState && (
+            <div className="download-tools-box">
+              {downloadState.tools.installing ? (
+                <>
+                  <div className="download-tools-row">
+                    <span>{downloadState.tools.installStage || "正在安装组件…"}</span>
+                    <button className="icon-button" onClick={() => void window.desktop.cancelDownloadToolsInstall()}>取消</button>
+                  </div>
+                  <div className="download-progress-track">
+                    <div
+                      className={`download-progress-fill ${downloadState.tools.installProgress === null ? "indeterminate" : ""}`}
+                      style={downloadState.tools.installProgress !== null && downloadState.tools.installProgress !== undefined ? { width: `${downloadState.tools.installProgress}%` } : undefined}
+                    />
+                  </div>
+                </>
+              ) : (!downloadState.tools.ytDlp.available || !downloadState.tools.ffmpeg.available) ? (
+                <>
+                  <div className="download-tools-row">
+                    <span className="download-tools-hint">
+                      {!downloadState.tools.ytDlp.available
+                        ? "缺少 yt-dlp（解析 YouTube / bilibili / HLS 必需）"
+                        : "已就绪 yt-dlp · 缺少 ffmpeg（用于合并 1080p+ 音视频）"}
+                    </span>
+                  </div>
+                  <div className="download-tools-actions">
+                    <button className="icon-button primary" onClick={() => void window.desktop.installDownloadTools()}>
+                      {!downloadState.tools.ytDlp.available ? "一键安装组件" : "安装 ffmpeg"}
+                    </button>
+                    {!downloadState.tools.ytDlp.available && (
+                      <button className="icon-button" onClick={() => void window.desktop.selectDownloadTool("yt-dlp")}>选择 yt-dlp…</button>
+                    )}
+                    {!downloadState.tools.ffmpeg.available && (
+                      <button className="icon-button" onClick={() => void window.desktop.selectDownloadTool("ffmpeg")}>选择 ffmpeg…</button>
+                    )}
+                  </div>
+                  {downloadState.tools.installError && (
+                    <div className="proxy-form-error">{downloadState.tools.installError}</div>
+                  )}
+                </>
+              ) : (
+                <div className="download-tools-ready">组件就绪：yt-dlp · ffmpeg</div>
+              )}
+            </div>
+          )}
+
+          {downloadState && (
+            <div className="download-dir-row">
+              <span className="download-dir-path" title={downloadState.tools.downloadDir}>
+                保存到：{downloadState.tools.downloadDir}
+              </span>
+              <button className="icon-button" onClick={() => void window.desktop.selectDownloadDir()}>更改</button>
+              <button className="icon-button" onClick={() => void window.desktop.openDownloadDir()}>打开目录</button>
+            </div>
+          )}
+
+          <div className="download-tasks-section">
+            <div className="download-tasks-header">
+              <span>下载列表</span>
+              {hasFinishedTasks && (
+                <button className="icon-button" onClick={() => void window.desktop.clearFinishedDownloads()}>清空已完成</button>
+              )}
+            </div>
+            {(!downloadState || downloadState.tasks.length === 0) ? (
+              <div className="download-empty-tasks">暂无下载任务</div>
+            ) : (
+              <div className="download-task-list">
+                {downloadState.tasks.map((task) => {
+                  const activeTask = isActiveDownloadTask(task);
+                  return (
+                    <div key={task.id} className={`download-task-item ${task.status}`}>
+                      <div className="download-task-top">
+                        <span className="download-task-name" title={task.fileName}>{task.fileName}</span>
+                        <span className="download-task-quality">{task.qualityLabel}</span>
+                      </div>
+                      {activeTask && (
+                        <div className="download-progress-track">
+                          <div
+                            className={`download-progress-fill ${task.progress === null ? "indeterminate" : ""}`}
+                            style={task.progress !== null ? { width: `${Math.min(100, Math.max(0, task.progress))}%` } : undefined}
+                          />
+                        </div>
+                      )}
+                      <div className="download-task-bottom">
+                        <span className={`download-task-status ${task.status === "failed" ? "error" : ""}`}>
+                          {formatTaskStatusText(task)}
+                        </span>
+                        <div className="download-task-actions">
+                          {activeTask ? (
+                            <button className="icon-button" onClick={() => void window.desktop.cancelDownloadTask(task.id)}>取消</button>
+                          ) : (
+                            <>
+                              {task.status === "completed" && (
+                                <button className="icon-button" onClick={() => void window.desktop.showDownloadedItem(task.id)}>打开位置</button>
+                              )}
+                              <button className="icon-button" onClick={() => void window.desktop.removeDownloadTask(task.id)}>清除</button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
       {(fullscreen || htmlFullscreen) && (
         <div className="fullscreen-top-zone">
           <div className="fullscreen-top-bar">

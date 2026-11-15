@@ -1,5 +1,6 @@
 /// <reference types="vite/client" />
 import type { AdblockStatus, BlockedNavigation } from "./shared/adblock";
+import type { DownloadProbeResult, DownloadStartRequest, DownloadStateSnapshot } from "./shared/downloads";
 
 interface DesktopApi {
   guestPreloadUrl: string;
@@ -37,6 +38,20 @@ interface DesktopApi {
   reportPlaybackState: (paneId: string, state: unknown) => Promise<boolean>;
   logFocusDiagnostic: (paneId: string, info: unknown) => Promise<boolean>;
   onChromeSessionError: (callback: (message: string) => void) => void;
+  getDownloadState: () => Promise<DownloadStateSnapshot | null>;
+  onDownloadStateChanged: (callback: (state: DownloadStateSnapshot) => void) => () => void;
+  probePaneDownload: (probeId: string, paneId: string) => Promise<DownloadProbeResult>;
+  cancelProbeDownload: (probeId: string) => Promise<boolean>;
+  startDownload: (request: DownloadStartRequest) => Promise<{ ok: true; taskId: string } | { ok: false; message: string }>;
+  cancelDownloadTask: (taskId: string) => Promise<boolean>;
+  removeDownloadTask: (taskId: string) => Promise<boolean>;
+  clearFinishedDownloads: () => Promise<boolean>;
+  selectDownloadDir: () => Promise<{ ok: boolean; canceled?: boolean; downloadDir?: string; message?: string }>;
+  openDownloadDir: () => Promise<boolean>;
+  showDownloadedItem: (taskId: string) => Promise<boolean>;
+  installDownloadTools: () => Promise<{ ok: boolean; message?: string }>;
+  cancelDownloadToolsInstall: () => Promise<boolean>;
+  selectDownloadTool: (tool: "yt-dlp" | "ffmpeg") => Promise<{ ok: boolean; canceled?: boolean; message?: string }>;
 }
 
 export {};

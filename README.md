@@ -20,6 +20,7 @@ Playback uses embedded Electron `<webview>` elements. The real Chrome browser is
 - Cloudflare challenge resources remain available inside Electron panes, while browser fingerprint emulation helps most sites complete verification; automatic refresh stops when a loop is detected.
 - Use the system file picker to play one local MP4, M4V, WebM, MOV, or OGV video with the existing play, seek, volume, and speed controls.
 - Supported HTML5 players inside same-origin, cross-origin, or nested iframes can reuse the application play, seek, volume, mute, and speed controls.
+- Supports video and file downloads: handles direct video links and browser downloads out of the box, and integrates `yt-dlp` + `ffmpeg` (with one-click in-app setup or custom binary paths) for quality selection, stream merging, and live download progress on YouTube, bilibili, and other supported sites.
 
 ## Usage
 

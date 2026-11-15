@@ -25,7 +25,7 @@ button { cursor: pointer; }
 .header-button { padding: 8px 13px; font-size: calc(12px * var(--app-font-scale)); }
 .header-button:hover, .preset-button:hover, .icon-button:hover { border-color: #5d7698; background: #253347; }
 .header-button.subtle { color: #a6b1c2; background: transparent; }
-.proxy-button.selected { color: #78dfca; border-color: #3b837e; background: #17332f; }
+.proxy-button.selected, .download-button.selected { color: #78dfca; border-color: #3b837e; background: #17332f; }
 .proxy-popover { color: #dbe4f1; border: 1px solid #3b485a; border-radius: 9px; background: #111923f8; box-shadow: 0 14px 36px #000a; }
 .global-proxy-popover { position: fixed; z-index: 50; top: 68px; right: 18px; width: min(390px, calc(100vw - 24px)); padding: 13px; }
 .pane-proxy-popover { position: absolute; z-index: 15; right: 16px; bottom: 62px; width: min(360px, calc(100% - 32px)); padding: 12px; }
@@ -144,6 +144,46 @@ button { cursor: pointer; }
 .fullscreen-top-bar { position: absolute; top: 0; left: 0; right: 0; height: 56px; display: flex; align-items: center; justify-content: center; gap: 14px; background: linear-gradient(180deg, #000000d9 0%, #00000088 60%, #00000000 100%); opacity: 0; transform: translateY(-100%); transition: opacity .18s ease, transform .18s ease; }
 .fullscreen-top-zone:hover .fullscreen-top-bar, .fullscreen-top-zone:focus-within .fullscreen-top-bar { opacity: 1; transform: translateY(0); }
 .fullscreen-hint { color: #dce6f2; font-size: calc(12px * var(--app-font-scale)); letter-spacing: .02em; }
+.download-popover { position: fixed; z-index: 55; top: 68px; right: 18px; width: min(440px, calc(100vw - 24px)); max-height: calc(100vh - 88px); display: flex; flex-direction: column; gap: 10px; padding: 13px; overflow-y: auto; }
+.download-popover.in-fullscreen { top: 18px; max-height: calc(100vh - 36px); }
+.download-popover-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.download-popover-header .proxy-popover-title { margin-bottom: 0; }
+.download-section { display: flex; flex-direction: column; gap: 8px; padding: 9px; border: 1px solid #243040; border-radius: 7px; background: #0d141d; }
+.download-target-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.download-target-label { min-width: 0; flex: 1; overflow: hidden; color: #9aa9be; font-size: calc(10px * var(--app-font-scale)); text-overflow: ellipsis; white-space: nowrap; }
+.download-probe-box { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #c7d4e6; font-size: calc(11px * var(--app-font-scale)); }
+.download-ready-box { display: flex; flex-direction: column; gap: 8px; }
+.download-video-title { color: #eef4fc; font-size: calc(12px * var(--app-font-scale)); font-weight: 600; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.download-field { display: flex; flex-direction: column; gap: 4px; color: #aebbd0; font-size: calc(10px * var(--app-font-scale)); }
+.download-name-row { display: flex; align-items: center; gap: 6px; }
+.download-name-row input, .download-field select { width: 100%; height: 29px; padding: 4px 7px; border: 1px solid #344152; border-radius: 6px; outline: none; color: #dae5f1; background: #161e2a; font-size: calc(11px * var(--app-font-scale)); }
+.download-name-row input:focus, .download-field select:focus { border-color: #58b7b0; box-shadow: 0 0 0 2px #58b7b022; }
+.download-ext-badge { flex: 0 0 auto; padding: 4px 7px; border: 1px solid #2b3848; border-radius: 6px; color: #9cb0c6; background: #141c27; font-size: calc(10px * var(--app-font-scale)); }
+.download-start-row { display: flex; justify-content: flex-end; }
+.download-error-box { color: #ffadad; font-size: calc(11px * var(--app-font-scale)); line-height: 1.45; }
+.download-tools-box { display: flex; flex-direction: column; gap: 7px; padding: 8px 9px; border: 1px solid #263344; border-radius: 7px; background: #0f1722; }
+.download-tools-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: calc(10px * var(--app-font-scale)); color: #c7d4e6; }
+.download-tools-hint { color: #ffd59a; line-height: 1.4; }
+.download-tools-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.download-tools-ready { color: #78dfca; font-size: calc(10px * var(--app-font-scale)); }
+.download-dir-row { display: flex; align-items: center; gap: 6px; }
+.download-dir-path { min-width: 0; flex: 1; overflow: hidden; color: #8c9bae; font-size: calc(10px * var(--app-font-scale)); text-overflow: ellipsis; white-space: nowrap; }
+.download-tasks-section { display: flex; flex-direction: column; gap: 7px; border-top: 1px solid #222d3b; padding-top: 9px; }
+.download-tasks-header { display: flex; align-items: center; justify-content: space-between; color: #c7d4e6; font-size: calc(11px * var(--app-font-scale)); font-weight: 600; }
+.download-empty-tasks { color: #6e7d91; font-size: calc(10px * var(--app-font-scale)); padding: 4px 0; }
+.download-task-list { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
+.download-task-item { display: flex; flex-direction: column; gap: 5px; padding: 7px 8px; border: 1px solid #243040; border-radius: 7px; background: #141c27; }
+.download-task-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.download-task-name { min-width: 0; flex: 1; overflow: hidden; color: #e2eaf4; font-size: calc(11px * var(--app-font-scale)); text-overflow: ellipsis; white-space: nowrap; }
+.download-task-quality { flex: 0 0 auto; color: #8898ad; font-size: calc(10px * var(--app-font-scale)); max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.download-progress-track { width: 100%; height: 5px; overflow: hidden; border-radius: 999px; background: #263141; }
+.download-progress-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #5ccdb4, #70a8ff); transition: width .16s ease; }
+.download-progress-fill.indeterminate { width: 40%; animation: download-indeterminate 1.2s ease-in-out infinite; }
+@keyframes download-indeterminate { 0% { transform: translateX(-100%); } 100% { transform: translateX(260%); } }
+.download-task-bottom { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.download-task-status { min-width: 0; flex: 1; color: #9cb0c6; font-size: calc(10px * var(--app-font-scale)); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.download-task-status.error { color: #ffadad; }
+.download-task-actions { display: flex; gap: 5px; flex: 0 0 auto; }
 
 @media (max-width: 900px) {
   .toolbar-hint { display: none; }

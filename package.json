@@ -1,6 +1,6 @@
 {
   "name": "same-screen-player",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A focused multi-pane video browser for watching streams side by side.",
   "private": true,
   "main": "dist-electron/electron/main.js",
@@ -15,7 +15,8 @@
     "adblock:update-snapshot": "node scripts/update-adblock-snapshot.cjs",
     "test:adblock": "npm run build && node scripts/verify-adblock.cjs",
     "test:video-sites": "npm run build && node scripts/verify-video-sites.cjs",
-    "test:playback-ui": "npm run build && node scripts/verify-playback-ui.cjs"
+    "test:playback-ui": "npm run build && node scripts/verify-playback-ui.cjs",
+    "test:downloads": "npm run build && node scripts/verify-downloads.cjs"
   },
   "dependencies": {
     "@ghostery/adblocker": "2.18.2",

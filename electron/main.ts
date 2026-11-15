@@ -1,6 +1,8 @@
-import { app, BrowserWindow, dialog, ipcMain, screen, session, webContents, webFrameMain } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, screen, session, shell, webContents, webFrameMain } from "electron";
 import { AdblockService } from "./adblock-service";
 import { AdblockSubscriptions, UPDATE_INTERVAL } from "./adblock-subscriptions";
+import { DownloadManager } from "./download-manager";
+import type { DownloadStartRequest } from "../src/shared/downloads";
 import { existsSync, promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -55,6 +57,7 @@ let adblockLogWindow = 0;
 let adblockLogCount = 0;
 let chromeManager: ChromeSessionManager | null = null;
 let windowsHelper: WindowsWindowHelper | null = null;
+let downloadManager: DownloadManager | null = null;
 const paneWebContents = new Map<number, string>();
 const panePartitions = new Map<string, string>();
 const paneProxySettings = new Map<string, PaneProxySettings>();
@@ -873,6 +876,115 @@ function registerIpc(): void {
     await Promise.all([...knownPartitions].map((partition) => session.fromPartition(partition).clearStorageData()));
     return true;
   });
+  ipcMain.handle("downloads:getState", () => downloadManager?.getSnapshot() ?? null);
+  ipcMain.handle("downloads:probePane", async (event, probeId: unknown, paneId: unknown) => {
+    if (event.sender !== mainWindow?.webContents || typeof probeId !== "string" || typeof paneId !== "string" || !downloadManager) {
+      return { ok: false, code: "failed", message: "下载服务未就绪", hasYtDlp: false, hasFfmpeg: false };
+    }
+    const webContentsId = [...paneWebContents.entries()].find(([, registeredPaneId]) => registeredPaneId === paneId)?.[0];
+    const contents = webContentsId === undefined ? null : webContents.fromId(webContentsId);
+    if (!contents || contents.isDestroyed()) {
+      return {
+        ok: false,
+        code: "invalid-url",
+        message: "分屏网页尚未准备好",
+        paneId,
+        ...(await downloadManager.refreshToolStatus().then((tools) => ({ hasYtDlp: tools.ytDlp.available, hasFfmpeg: tools.ffmpeg.available }))),
+      };
+    }
+    const partition = panePartitions.get(paneId) ?? "persist:shared";
+    const targetSession = session.fromPartition(partition);
+    const effectiveProxy = resolveProxySettings(globalProxySettings, paneProxySettings.get(paneId) ?? defaultPaneProxySettings());
+    return downloadManager.probePane(probeId, paneId, contents, targetSession, effectiveProxy);
+  });
+  ipcMain.handle("downloads:cancelProbe", (event, probeId: unknown) => {
+    if (event.sender !== mainWindow?.webContents || typeof probeId !== "string" || !downloadManager) return false;
+    return downloadManager.cancelProbe(probeId);
+  });
+  ipcMain.handle("downloads:start", async (event, request: unknown) => {
+    if (event.sender !== mainWindow?.webContents || !downloadManager || !request || typeof request !== "object") {
+      return { ok: false, message: "无效下载请求" };
+    }
+    const input = request as Partial<DownloadStartRequest>;
+    if (
+      typeof input.paneId !== "string"
+      || typeof input.pageUrl !== "string"
+      || typeof input.probeUrl !== "string"
+      || (input.sourceType !== "yt-dlp" && input.sourceType !== "direct")
+      || typeof input.fileName !== "string"
+      || typeof input.qualityId !== "string"
+      || typeof input.selector !== "string"
+      || typeof input.qualityLabel !== "string"
+    ) {
+      return { ok: false, message: "下载参数不完整" };
+    }
+    const partition = panePartitions.get(input.paneId) ?? "persist:shared";
+    const targetSession = session.fromPartition(partition);
+    const effectiveProxy = resolveProxySettings(globalProxySettings, paneProxySettings.get(input.paneId) ?? defaultPaneProxySettings());
+    return downloadManager.startDownload(input as DownloadStartRequest, targetSession, effectiveProxy);
+  });
+  ipcMain.handle("downloads:cancelTask", (event, taskId: unknown) => {
+    if (event.sender !== mainWindow?.webContents || typeof taskId !== "string" || !downloadManager) return false;
+    return downloadManager.cancelTask(taskId);
+  });
+  ipcMain.handle("downloads:removeTask", (event, taskId: unknown) => {
+    if (event.sender !== mainWindow?.webContents || typeof taskId !== "string" || !downloadManager) return false;
+    return downloadManager.removeTask(taskId);
+  });
+  ipcMain.handle("downloads:clearFinished", (event) => {
+    if (event.sender !== mainWindow?.webContents || !downloadManager) return false;
+    downloadManager.clearFinishedTasks();
+    return true;
+  });
+  ipcMain.handle("downloads:selectDir", async (event) => {
+    if (event.sender !== mainWindow?.webContents || !downloadManager) return { ok: false };
+    const dialogOptions: Electron.OpenDialogOptions = {
+      title: "选择下载保存目录",
+      defaultPath: downloadManager.getDownloadDir(),
+      properties: ["openDirectory", "createDirectory"],
+    };
+    const result = mainWindow
+      ? await dialog.showOpenDialog(mainWindow, dialogOptions)
+      : await dialog.showOpenDialog(dialogOptions);
+    if (result.canceled || result.filePaths.length === 0) return { ok: false, canceled: true };
+    const saved = await downloadManager.setDownloadDir(result.filePaths[0]);
+    return saved ? { ok: true, downloadDir: downloadManager.getDownloadDir() } : { ok: false, message: "所选目录不可写入" };
+  });
+  ipcMain.handle("downloads:openDir", async (event) => {
+    if (event.sender !== mainWindow?.webContents || !downloadManager) return false;
+    const error = await shell.openPath(downloadManager.getDownloadDir());
+    return error === "";
+  });
+  ipcMain.handle("downloads:showItem", (event, taskId: unknown) => {
+    if (event.sender !== mainWindow?.webContents || typeof taskId !== "string" || !downloadManager) return false;
+    const filePath = downloadManager.getTaskFilePath(taskId);
+    if (!filePath) return false;
+    shell.showItemInFolder(filePath);
+    return true;
+  });
+  ipcMain.handle("downloads:installTools", async (event) => {
+    if (event.sender !== mainWindow?.webContents || !downloadManager) return { ok: false, message: "下载服务未就绪" };
+    return downloadManager.installTools();
+  });
+  ipcMain.handle("downloads:cancelInstall", (event) => {
+    if (event.sender !== mainWindow?.webContents || !downloadManager) return false;
+    return downloadManager.cancelToolInstall();
+  });
+  ipcMain.handle("downloads:selectTool", async (event, tool: unknown) => {
+    if (event.sender !== mainWindow?.webContents || !downloadManager || (tool !== "yt-dlp" && tool !== "ffmpeg")) {
+      return { ok: false, message: "无效组件" };
+    }
+    const dialogOptions: Electron.OpenDialogOptions = {
+      title: tool === "yt-dlp" ? "选择 yt-dlp 可执行文件" : "选择 ffmpeg 可执行文件",
+      properties: ["openFile"],
+      ...(process.platform === "win32" ? { filters: [{ name: "可执行文件", extensions: ["exe"] }] } : {}),
+    };
+    const result = mainWindow
+      ? await dialog.showOpenDialog(mainWindow, dialogOptions)
+      : await dialog.showOpenDialog(dialogOptions);
+    if (result.canceled || result.filePaths.length === 0) return { ok: false, canceled: true };
+    return downloadManager.setCustomToolPath(tool, result.filePaths[0]);
+  });
 }
 
 function installSessionDiagnostics(targetSession: Electron.Session): void {
@@ -911,6 +1023,7 @@ function configureSession(targetSession: Electron.Session): void {
   installHeaderDiagnostics(targetSession);
   installSessionDiagnostics(targetSession);
   adblockService.prepareSession(targetSession, ADBLOCK_PRELOAD_PATH);
+  downloadManager?.attachSessionDownloads(targetSession);
 }
 
 function createWindow(): void {
@@ -1010,6 +1123,17 @@ app.whenReady().then(async () => {
     changed: status => sendWindowMessage("adblock:status-changed", status),
   });
   await subscriptions.initialize();
+  downloadManager = new DownloadManager({
+    userDataDir: app.getPath("userData"),
+    defaultDownloadDir: app.getPath("downloads"),
+    bundledToolsDir: app.isPackaged ? path.join(process.resourcesPath, "tools") : undefined,
+    appToolsDir: path.join(app.getAppPath(), "tools"),
+    userAgent: chromeUserAgent(),
+    fetchWithProxy: (url, options) => session.fromPartition("persist:shared").fetch(url, options),
+    getPaneIdByWebContentsId: (webContentsId) => paneWebContents.get(webContentsId),
+    onStateChanged: (snapshot) => sendWindowMessage("downloads:state", snapshot),
+  });
+  await downloadManager.initialize();
   configureSession(session.fromPartition("persist:shared"));
   windowsHelper = new WindowsWindowHelper(helperScriptPath());
   windowsHelper.start();
@@ -1028,6 +1152,7 @@ app.on("window-all-closed", () => {
 app.on("before-quit", () => {
   if (adblockUpdateTimer) clearInterval(adblockUpdateTimer);
   adblockService?.dispose();
+  downloadManager?.dispose();
   windowsHelper?.stop();
   void chromeManager?.closeAll();
 });

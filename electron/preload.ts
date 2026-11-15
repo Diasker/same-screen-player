@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { AdblockStatus, BlockedNavigation } from "../src/shared/adblock";
+import type { DownloadProbeResult, DownloadStartRequest, DownloadStateSnapshot } from "../src/shared/downloads";
 
 let fullscreenListener: ((event: Electron.IpcRendererEvent, fullscreen: unknown) => void) | null = null;
 let htmlFullscreenListener: ((event: Electron.IpcRendererEvent, paneId: unknown, fullscreen: unknown) => void) | null = null;
@@ -89,4 +90,34 @@ contextBridge.exposeInMainWorld("desktop", {
     chromeSessionErrorListener = (_event, message) => { if (typeof message === "string") callback(message); };
     ipcRenderer.on("chrome:sessionError", chromeSessionErrorListener);
   },
+  getDownloadState: (): Promise<DownloadStateSnapshot | null> => ipcRenderer.invoke("downloads:getState"),
+  onDownloadStateChanged: (callback: (state: DownloadStateSnapshot) => void): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, state: DownloadStateSnapshot) => callback(state);
+    ipcRenderer.on("downloads:state", listener);
+    return () => ipcRenderer.removeListener("downloads:state", listener);
+  },
+  probePaneDownload: (probeId: string, paneId: string): Promise<DownloadProbeResult> =>
+    ipcRenderer.invoke("downloads:probePane", probeId, paneId),
+  cancelProbeDownload: (probeId: string): Promise<boolean> =>
+    ipcRenderer.invoke("downloads:cancelProbe", probeId),
+  startDownload: (request: DownloadStartRequest): Promise<{ ok: true; taskId: string } | { ok: false; message: string }> =>
+    ipcRenderer.invoke("downloads:start", request),
+  cancelDownloadTask: (taskId: string): Promise<boolean> =>
+    ipcRenderer.invoke("downloads:cancelTask", taskId),
+  removeDownloadTask: (taskId: string): Promise<boolean> =>
+    ipcRenderer.invoke("downloads:removeTask", taskId),
+  clearFinishedDownloads: (): Promise<boolean> =>
+    ipcRenderer.invoke("downloads:clearFinished"),
+  selectDownloadDir: (): Promise<{ ok: boolean; canceled?: boolean; downloadDir?: string; message?: string }> =>
+    ipcRenderer.invoke("downloads:selectDir"),
+  openDownloadDir: (): Promise<boolean> =>
+    ipcRenderer.invoke("downloads:openDir"),
+  showDownloadedItem: (taskId: string): Promise<boolean> =>
+    ipcRenderer.invoke("downloads:showItem", taskId),
+  installDownloadTools: (): Promise<{ ok: boolean; message?: string }> =>
+    ipcRenderer.invoke("downloads:installTools"),
+  cancelDownloadToolsInstall: (): Promise<boolean> =>
+    ipcRenderer.invoke("downloads:cancelInstall"),
+  selectDownloadTool: (tool: "yt-dlp" | "ffmpeg"): Promise<{ ok: boolean; canceled?: boolean; message?: string }> =>
+    ipcRenderer.invoke("downloads:selectTool", tool),
 });
