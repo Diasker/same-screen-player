@@ -20,6 +20,7 @@ export type DownloadProbeResult =
       paneId: string;
       pageUrl: string;
       probeUrl: string;
+      refererUrl?: string;
       title: string;
       suggestedName: string;
       sourceType: "yt-dlp" | "direct";
@@ -42,6 +43,7 @@ export type DownloadProbeResult =
 export type DownloadTaskStatus =
   | "queued"
   | "downloading"
+  | "paused"
   | "merging"
   | "completed"
   | "failed"
@@ -91,6 +93,7 @@ export type DownloadStartRequest = {
   paneId: string;
   pageUrl: string;
   probeUrl: string;
+  refererUrl?: string;
   sourceType: "yt-dlp" | "direct";
   directUrl?: string;
   fileName: string;
@@ -110,10 +113,36 @@ export type RawYtDlpFormat = {
   width?: unknown;
   fps?: unknown;
   tbr?: unknown;
+  vbr?: unknown;
+  abr?: unknown;
   filesize?: unknown;
   filesize_approx?: unknown;
   format_note?: unknown;
+  url?: unknown;
+  protocol?: unknown;
+  http_headers?: unknown;
 };
+
+export type ResolvedStreamSpec = {
+  formatId: string;
+  url: string;
+  ext: string;
+  headers: Record<string, string>;
+  filesizeApprox?: number;
+};
+
+export type ConcurrentFormatSelection =
+  | {
+      mode: "single";
+      stream: ResolvedStreamSpec;
+      isAudioOnly: boolean;
+    }
+  | {
+      mode: "dual";
+      video: ResolvedStreamSpec;
+      audio: ResolvedStreamSpec;
+      isAudioOnly: false;
+    };
 
 export type ParsedYtDlpProgress = {
   kind: "download" | "postprocess";
@@ -126,6 +155,55 @@ export type ParsedYtDlpProgress = {
 };
 
 const WINDOWS_RESERVED_NAMES = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+const UNSUPPORTED_MEDIA_EXTENSIONS = new Set([
+  "html",
+  "htm",
+  "xhtml",
+  "mhtml",
+  "shtml",
+  "php",
+  "asp",
+  "aspx",
+  "jsp",
+]);
+
+export function isUnsupportedMediaExtension(ext: unknown): boolean {
+  if (typeof ext !== "string") return false;
+  return UNSUPPORTED_MEDIA_EXTENSIONS.has(ext.trim().toLowerCase());
+}
+
+export function normalizeDownloadProbeUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    if (host === "bilibili.com" || host === "www.bilibili.com" || host === "m.bilibili.com") {
+      // Bilibili redirects some sessions/regions to /zh-Hans/video/... or /en/video/...,
+      // which yt-dlp's BiliBili extractor does not match directly.
+      parsed.pathname = parsed.pathname.replace(
+        /^\/(?:zh-Hans|zh-Hant|zh-CN|zh-TW|zh-HK|en|ja|ko|th|vi|id|ms|es|pt|fr|de|ru|ar)(?=\/(?:video|bangumi|cheese|festival|list|medialist)\b)/i,
+        ""
+      );
+      if (host === "m.bilibili.com") {
+        parsed.hostname = "www.bilibili.com";
+      }
+      return parsed.toString();
+    }
+    return rawUrl;
+  } catch {
+    return rawUrl;
+  }
+}
+
+export function hasExtractableMediaInfo(info: { ext?: unknown; formats?: RawYtDlpFormat[] }): boolean {
+  const formats = Array.isArray(info.formats) ? info.formats : [];
+  if (formats.length > 0) {
+    return formats.some((item) => {
+      if (isUnsupportedMediaExtension(item.ext)) return false;
+      return hasCodec(item.vcodec) || hasCodec(item.acodec) || (typeof item.ext === "string" && item.ext.trim().length > 0);
+    });
+  }
+  return typeof info.ext === "string" && info.ext.trim().length > 0 && !isUnsupportedMediaExtension(info.ext);
+}
 
 export function sanitizeDownloadFileName(raw: string, fallback = "video"): string {
   const safeFallback = fallback.trim() || "video";
@@ -194,7 +272,9 @@ export function buildQualityOptions(
   hasFfmpeg: boolean,
   durationSeconds?: number
 ): DownloadQualityOption[] {
-  const validFormats = Array.isArray(formats) ? formats : [];
+  const validFormats = Array.isArray(formats)
+    ? formats.filter((item) => !isUnsupportedMediaExtension(item.ext))
+    : [];
   const videoFormats = validFormats.filter((item) => hasCodec(item.vcodec));
   const audioFormats = validFormats.filter((item) => !hasCodec(item.vcodec) && hasCodec(item.acodec));
   const combinedFormats = videoFormats.filter((item) => hasCodec(item.acodec));
@@ -306,6 +386,158 @@ export function buildQualityOptions(
   }
 
   return options;
+}
+
+function isDirectHttpUrl(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 8192) return false;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function isDirectHttpFormat(item: RawYtDlpFormat): boolean {
+  if (isUnsupportedMediaExtension(item.ext)) return false;
+  if (!isDirectHttpUrl(item.url)) return false;
+  if (/\.(?:m3u8|mpd)(?:$|\?)/i.test(item.url)) return false;
+  if (typeof item.protocol === "string" && item.protocol.trim().length > 0) {
+    const proto = item.protocol.trim().toLowerCase();
+    if (proto !== "http" && proto !== "https") return false;
+  }
+  return true;
+}
+
+function extractStringHeaders(raw: unknown): Record<string, string> {
+  const result: Record<string, string> = {};
+  if (!raw || typeof raw !== "object") return result;
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value === "string" && key.trim().length > 0) {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+function toResolvedStreamSpec(item: RawYtDlpFormat, topLevelHeaders?: Record<string, string>): ResolvedStreamSpec {
+  const formatId = typeof item.format_id === "string" ? item.format_id : String(item.format_id ?? "unknown");
+  const ext = typeof item.ext === "string" && /^[a-z0-9]{1,8}$/i.test(item.ext) ? item.ext.toLowerCase() : "mp4";
+  const filesizeApprox = positiveNumber(item.filesize) ?? positiveNumber(item.filesize_approx);
+  return {
+    formatId,
+    url: item.url as string,
+    ext,
+    headers: {
+      ...(topLevelHeaders ?? {}),
+      ...extractStringHeaders(item.http_headers),
+    },
+    ...(filesizeApprox ? { filesizeApprox } : {}),
+  };
+}
+
+function scoreVideoFormat(item: RawYtDlpFormat, hasFfmpeg: boolean): number {
+  const height = Math.round(positiveNumber(item.height) ?? 0);
+  const fps = positiveNumber(item.fps) ?? 30;
+  const tbr = positiveNumber(item.tbr) ?? positiveNumber(item.vbr) ?? 0;
+  const size = positiveNumber(item.filesize) ?? positiveNumber(item.filesize_approx) ?? 0;
+  const isCombined = hasCodec(item.acodec);
+  const ext = typeof item.ext === "string" ? item.ext.toLowerCase() : "";
+  const mp4Bonus = ext === "mp4" || ext === "m4v" ? 1_000 : 0;
+  const combinedBonus = !hasFfmpeg && isCombined ? 1_000_000_000 : 0;
+  return combinedBonus + height * 1_000_000 + mp4Bonus + fps * 100 + tbr + size / 1_000_000;
+}
+
+function scoreAudioFormat(item: RawYtDlpFormat, preferMp4Container: boolean): number {
+  const tbr = positiveNumber(item.abr) ?? positiveNumber(item.tbr) ?? 0;
+  const size = positiveNumber(item.filesize) ?? positiveNumber(item.filesize_approx) ?? 0;
+  const ext = typeof item.ext === "string" ? item.ext.toLowerCase() : "";
+  const containerBonus = preferMp4Container && (ext === "m4a" || ext === "mp4") ? 10_000 : 0;
+  return containerBonus + tbr * 10 + size / 1_000_000;
+}
+
+export function selectConcurrentFormats(
+  formats: RawYtDlpFormat[],
+  qualityId: string,
+  hasFfmpeg: boolean,
+  topLevelHeaders?: Record<string, string>
+): ConcurrentFormatSelection | null {
+  const validFormats = Array.isArray(formats)
+    ? formats.filter((item) => !isUnsupportedMediaExtension(item.ext))
+    : [];
+  if (validFormats.length === 0) return null;
+
+  const allAudio = validFormats.filter((item) => !hasCodec(item.vcodec) && hasCodec(item.acodec));
+
+  if (qualityId === "audio") {
+    const directAudio = allAudio.filter(isDirectHttpFormat);
+    if (directAudio.length === 0) return null;
+    directAudio.sort((a, b) => scoreAudioFormat(b, false) - scoreAudioFormat(a, false));
+    return {
+      mode: "single",
+      stream: toResolvedStreamSpec(directAudio[0], topLevelHeaders),
+      isAudioOnly: true,
+    };
+  }
+
+  const allVideo = validFormats.filter((item) => hasCodec(item.vcodec));
+  if (allVideo.length === 0) return null;
+
+  let candidateVideos = allVideo;
+  if (qualityId.startsWith("h:")) {
+    const targetHeight = Number(qualityId.slice(2));
+    if (!Number.isFinite(targetHeight) || targetHeight <= 0) return null;
+    const exact = allVideo.filter((item) => Math.round(positiveNumber(item.height) ?? 0) === targetHeight);
+    if (exact.length > 0) {
+      candidateVideos = exact;
+    } else {
+      const below = allVideo.filter((item) => {
+        const h = positiveNumber(item.height);
+        return h !== undefined && Math.round(h) <= targetHeight;
+      });
+      if (below.length === 0) return null;
+      candidateVideos = below;
+    }
+  }
+
+  const playableCandidates = hasFfmpeg
+    ? candidateVideos
+    : candidateVideos.filter((item) => hasCodec(item.acodec));
+  if (playableCandidates.length === 0) return null;
+
+  const sortedAll = [...playableCandidates].sort(
+    (a, b) => scoreVideoFormat(b, hasFfmpeg) - scoreVideoFormat(a, hasFfmpeg)
+  );
+  const chosenVideo = sortedAll[0];
+  if (!chosenVideo || !isDirectHttpFormat(chosenVideo)) return null;
+
+  if (hasCodec(chosenVideo.acodec)) {
+    return {
+      mode: "single",
+      stream: toResolvedStreamSpec(chosenVideo, topLevelHeaders),
+      isAudioOnly: false,
+    };
+  }
+
+  if (!hasFfmpeg) return null;
+  if (allAudio.length === 0) {
+    return {
+      mode: "single",
+      stream: toResolvedStreamSpec(chosenVideo, topLevelHeaders),
+      isAudioOnly: false,
+    };
+  }
+
+  const sortedAudio = [...allAudio].sort((a, b) => scoreAudioFormat(b, true) - scoreAudioFormat(a, true));
+  const chosenAudio = sortedAudio[0];
+  if (!chosenAudio || !isDirectHttpFormat(chosenAudio)) return null;
+
+  return {
+    mode: "dual",
+    video: toResolvedStreamSpec(chosenVideo, topLevelHeaders),
+    audio: toResolvedStreamSpec(chosenAudio, topLevelHeaders),
+    isAudioOnly: false,
+  };
 }
 
 function parseFiniteNumber(value: string | undefined): number | null {

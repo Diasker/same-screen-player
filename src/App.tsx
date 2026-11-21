@@ -3,7 +3,7 @@ import type { AdblockStatus, BlockedNavigation } from "./shared/adblock";
 import type { CSSProperties, ReactElement } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import {
-  MAX_PANES,
+  createCustomGrid,
   createPreset,
   defaultGlobalProxySettings,
   defaultPaneProxySettings,
@@ -84,13 +84,16 @@ function emptyPlayback(): PlaybackSnapshot {
 const RATE_OPTIONS = [0.5, 0.75, 1, 1.25, 1.5, 2];
 const CUSTOM_RATE_VALUE = "custom";
 const FONT_SCALE_OPTIONS = [0.8, 0.9, 1, 1.1, 1.25, 1.4];
+const CUSTOM_FONT_SCALE_VALUE = "custom";
+const MIN_FONT_SCALE = 0.5;
+const MAX_FONT_SCALE = 2.5;
 const FONT_SCALE_STORAGE_KEY = "same-screen-player.font-scale";
 
 function initialFontScale(): number {
   if (typeof window === "undefined") return 1;
   try {
     const value = Number(window.localStorage.getItem(FONT_SCALE_STORAGE_KEY));
-    return FONT_SCALE_OPTIONS.includes(value) ? value : 1;
+    return Number.isFinite(value) && value >= MIN_FONT_SCALE && value <= MAX_FONT_SCALE ? value : 1;
   } catch {
     return 1;
   }
@@ -1041,7 +1044,7 @@ function LayoutSurface(props: LayoutSurfaceProps): ReactElement {
     event.preventDefault();
     props.onActive(paneId);
     const menuWidth = 150;
-    const menuHeight = 42;
+    const menuHeight = 122;
     setContextMenu({ paneId, left: Math.max(6, Math.min(event.clientX, window.innerWidth - menuWidth - 6)), top: Math.max(6, Math.min(event.clientY, window.innerHeight - menuHeight - 6)) });
   };
 
@@ -1054,7 +1057,48 @@ function LayoutSurface(props: LayoutSurfaceProps): ReactElement {
         return <div key={rect.paneId} ref={(element) => { if (element) paneRefs.current.set(rect.paneId, element); else paneRefs.current.delete(rect.paneId); }} className={`layout-pane ${isDragged ? "is-dragging" : ""} ${isDropTarget ? "is-drop-target" : ""}`} style={{ left: `${rect.left * 100}%`, top: `${rect.top * 100}%`, width: `${rect.width * 100}%`, height: `${rect.height * 100}%`, transform: isDragged ? `translate(${dragState.offsetX}px, ${dragState.offsetY}px)` : undefined }} onPointerDown={(event) => startDrag(event, rect.paneId)} onPointerMove={updateDrag} onPointerUp={finishDrag} onPointerCancel={finishDrag} onContextMenu={(event) => showContextMenu(event, rect.paneId)}><PaneView runtime={runtime} active={props.activePaneId === rect.paneId} paneDownloadProgress={props.activeDownloadProgressByPane[rect.paneId] ?? null} interactionMode={props.interactionMode} debugOverlays={props.debugOverlays} guestPreloadUrl={props.guestPreloadUrl} onActive={() => props.onActive(rect.paneId)} onNavigate={(value) => props.onNavigate(rect.paneId, value)} onUpdate={(patch) => props.onUpdatePane(rect.paneId, patch)} onProxyChange={(settings) => props.onProxyChange(rect.paneId, settings)} onSplit={(orientation) => props.onSplit(rect.paneId, orientation)} onRemove={() => props.onRemove(rect.paneId)} onOpenChrome={() => props.onOpenChrome(rect.paneId)} onDownload={() => props.onDownloadPane(rect.paneId)} /></div>;
       })}
       {geometry.dividers.map((divider) => <LayoutDivider key={divider.path.join(".")} divider={divider} onResize={props.onResize} />)}
-      {contextMenu && <div className="pane-context-menu" style={{ left: contextMenu.left, top: contextMenu.top }} role="menu"><button type="button" role="menuitem" className="pane-context-action" disabled={geometry.panes.length <= 1} onClick={() => { setContextMenu(null); props.onRemove(contextMenu.paneId); }}>关闭当前分屏</button></div>}
+      {contextMenu && (
+        <div className="pane-context-menu" style={{ left: contextMenu.left, top: contextMenu.top }} role="menu">
+          <button
+            type="button"
+            role="menuitem"
+            className="pane-context-action"
+            onClick={() => {
+              const targetId = contextMenu.paneId;
+              setContextMenu(null);
+              props.onSplit(targetId, "horizontal");
+            }}
+          >
+            左右分屏
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className="pane-context-action"
+            onClick={() => {
+              const targetId = contextMenu.paneId;
+              setContextMenu(null);
+              props.onSplit(targetId, "vertical");
+            }}
+          >
+            上下分屏
+          </button>
+          <div className="pane-context-separator" />
+          <button
+            type="button"
+            role="menuitem"
+            className="pane-context-action"
+            disabled={geometry.panes.length <= 1}
+            onClick={() => {
+              const targetId = contextMenu.paneId;
+              setContextMenu(null);
+              props.onRemove(targetId);
+            }}
+          >
+            关闭当前分屏
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1088,9 +1132,20 @@ function isActiveDownloadTask(task: DownloadTask): boolean {
   return task.status === "queued" || task.status === "downloading" || task.status === "merging";
 }
 
+function isFinishedDownloadTask(task: DownloadTask): boolean {
+  return task.status === "completed" || task.status === "failed" || task.status === "canceled";
+}
+
 function formatTaskStatusText(task: DownloadTask): string {
   if (task.status === "queued") return "准备中…";
   if (task.status === "merging") return "正在合并音视频…";
+  if (task.status === "paused") {
+    const parts = ["已暂停"];
+    if (task.progress !== null) parts.push(`${task.progress.toFixed(1)}%`);
+    if (task.totalBytes) parts.push(`${formatBytes(task.downloadedBytes)} / ${formatBytes(task.totalBytes)}`);
+    else if (task.downloadedBytes > 0) parts.push(formatBytes(task.downloadedBytes));
+    return parts.join(" · ");
+  }
   if (task.status === "completed") {
     return task.totalBytes ? `已完成 · ${formatBytes(task.totalBytes)}` : "已完成";
   }
@@ -1122,10 +1177,16 @@ export default function App(): ReactElement {
   const [htmlFullscreenPaneId, setHtmlFullscreenPaneId] = useState<string | null>(null);
   const [interactionMode, setInteractionMode] = useState<InteractionMode>("web");
   const [fontScale, setFontScale] = useState(initialFontScale);
+  const [customFontScaleOpen, setCustomFontScaleOpen] = useState(false);
+  const [customFontScaleInput, setCustomFontScaleInput] = useState(() => String(Math.round(initialFontScale() * 100)));
   const [globalProxy, setGlobalProxy] = useState<GlobalProxySettings>(() => defaultGlobalProxySettings());
   const [globalProxyDraft, setGlobalProxyDraft] = useState<GlobalProxySettings>(() => defaultGlobalProxySettings());
   const [globalProxyOpen, setGlobalProxyOpen] = useState(false);
   const [globalProxyError, setGlobalProxyError] = useState<string | null>(null);
+  const [customGridOpen, setCustomGridOpen] = useState(false);
+  const [customGridColumns, setCustomGridColumns] = useState("3");
+  const [customGridRows, setCustomGridRows] = useState("3");
+  const [customGridHover, setCustomGridHover] = useState<{ columns: number; rows: number } | null>(null);
   const [downloadState, setDownloadState] = useState<DownloadStateSnapshot | null>(null);
   const [downloadPopoverOpen, setDownloadPopoverOpen] = useState(false);
   const [downloadTargetPaneId, setDownloadTargetPaneId] = useState("pane-1");
@@ -1239,6 +1300,10 @@ export default function App(): ReactElement {
       if (oldStatus !== task.status) {
         if (oldStatus === undefined && isActiveDownloadTask(task)) {
           setStatus(`开始下载：${task.fileName}`);
+        } else if (task.status === "paused" && oldStatus !== undefined) {
+          setStatus(`已暂停：${task.fileName}`);
+        } else if (task.status === "downloading" && oldStatus === "paused") {
+          setStatus(`继续下载：${task.fileName}`);
         } else if (task.status === "completed" && oldStatus !== undefined) {
           setStatus(`下载完成：${task.fileName}`);
         } else if (task.status === "failed" && oldStatus !== undefined) {
@@ -1294,11 +1359,53 @@ export default function App(): ReactElement {
   }, [activePaneId, fullscreen, htmlFullscreen, htmlFullscreenPaneId, interactionMode]);
 
   useEffect(() => {
+    if (!customFontScaleOpen) return;
+    const close = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof HTMLElement && target.closest(".font-scale-wrapper")) return;
+      setCustomFontScaleOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        setCustomFontScaleOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", close, true);
+    document.addEventListener("keydown", closeOnEscape, true);
+    return () => {
+      document.removeEventListener("pointerdown", close, true);
+      document.removeEventListener("keydown", closeOnEscape, true);
+    };
+  }, [customFontScaleOpen]);
+
+  useEffect(() => {
+    if (!customGridOpen) return;
+    const close = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof HTMLElement && target.closest(".custom-grid-wrapper")) return;
+      setCustomGridOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        setCustomGridOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", close, true);
+    document.addEventListener("keydown", closeOnEscape, true);
+    return () => {
+      document.removeEventListener("pointerdown", close, true);
+      document.removeEventListener("keydown", closeOnEscape, true);
+    };
+  }, [customGridOpen]);
+
+  useEffect(() => {
     let cancelled = false;
     void window.desktop.loadLayout().then((saved) => {
       if (cancelled) return;
       const value = saved as { version?: number; layout?: unknown };
-      if (value.version === 1 && isLayoutNode(value.layout) && getPaneIds(value.layout).length <= MAX_PANES) setLayout(value.layout);
+      if (value.version === 1 && isLayoutNode(value.layout)) setLayout(value.layout);
       setGuestPreloadUrl(window.desktop.guestPreloadUrl);
       setStatus("布局已加载");
     }).catch(() => setStatus("使用默认布局"));
@@ -1324,10 +1431,40 @@ export default function App(): ReactElement {
       return { ...current, [paneId]: { ...previous, ...patch } };
     });
   }, []);
-  const applyPreset = (preset: Preset) => { setLayout(createPreset(preset)); setStatus(`${presetLabel(preset)}布局已应用`); };
+  const applyCustomFontScale = () => {
+    const percent = Number(customFontScaleInput.trim());
+    if (!Number.isFinite(percent) || percent < MIN_FONT_SCALE * 100 || percent > MAX_FONT_SCALE * 100) {
+      setStatus(`字号百分比需在 ${Math.round(MIN_FONT_SCALE * 100)}% 到 ${Math.round(MAX_FONT_SCALE * 100)}% 之间`);
+      return;
+    }
+    const nextScale = Math.round(percent) / 100;
+    setFontScale(nextScale);
+    setCustomFontScaleInput(String(Math.round(nextScale * 100)));
+    setCustomFontScaleOpen(false);
+    setStatus(`应用字号已设为 ${Math.round(nextScale * 100)}%`);
+  };
+  const applyPreset = (preset: Preset) => { setLayout(createPreset(preset)); setCustomGridOpen(false); setStatus(`${presetLabel(preset)}布局已应用`); };
+  const applyCustomGrid = (columns: number, rows: number) => {
+    const safeColumns = Math.max(1, Math.floor(columns));
+    const safeRows = Math.max(1, Math.floor(rows));
+    setLayout(createCustomGrid(safeColumns, safeRows));
+    setCustomGridColumns(String(safeColumns));
+    setCustomGridRows(String(safeRows));
+    setCustomGridHover(null);
+    setCustomGridOpen(false);
+    setStatus(`${safeColumns}×${safeRows} 布局已应用（共 ${safeColumns * safeRows} 格）`);
+  };
+  const submitCustomGridInputs = () => {
+    const columns = Number(customGridColumns);
+    const rows = Number(customGridRows);
+    if (!Number.isInteger(columns) || columns < 1 || !Number.isInteger(rows) || rows < 1) {
+      setStatus("请输入大于 0 的整数列数和行数");
+      return;
+    }
+    applyCustomGrid(columns, rows);
+  };
   const resizeDivider = (path: number[], ratio: number) => setLayout((current) => setRatioAtPath(current, path, ratio));
   const split = (paneId: string, orientation: Orientation) => {
-    if (paneIds.length >= MAX_PANES) { setStatus("已达到最多 6 格限制"); return; }
     setLayout(splitPane(layout, paneId, orientation));
     setStatus("已新增分屏");
   };
@@ -1538,6 +1675,7 @@ export default function App(): ReactElement {
       paneId: probeState.result.paneId,
       pageUrl: probeState.result.pageUrl,
       probeUrl: probeState.result.probeUrl,
+      refererUrl: probeState.result.refererUrl,
       sourceType: probeState.result.sourceType,
       directUrl: probeState.result.directUrl,
       fileName: downloadFileName.trim() || probeState.result.suggestedName,
@@ -1586,12 +1724,102 @@ export default function App(): ReactElement {
   const selectedQuality = probeState.status === "ready"
     ? (probeState.result.qualities.find((item) => item.id === selectedQualityId) ?? probeState.result.qualities[0])
     : undefined;
-  const hasFinishedTasks = Boolean(downloadState?.tasks.some((task) => !isActiveDownloadTask(task)));
+  const hasFinishedTasks = Boolean(downloadState?.tasks.some(isFinishedDownloadTask));
 
   return (
     <div className={`app-shell ${fullscreen ? "is-fullscreen" : ""} ${htmlFullscreen ? "is-html-fullscreen" : ""} ${interactionMode === "app" ? "is-app-input-mode" : "is-web-input-mode"}`} style={{ "--app-font-scale": fontScale } as CSSProperties}>
-       <header className="app-header"><div className="brand"><div className="brand-mark">▦</div><div><div className="brand-title">同屏播放</div><div className="brand-subtitle">沉浸式多视频工作台</div></div></div><div className="header-actions"><span className={`interaction-mode ${interactionMode}`}>{interactionMode === "web" ? "网页操作" : "应用操作"}</span><button className="header-button" onClick={toggleInputMode}>{interactionMode === "web" ? "切到应用层" : "切回网页层"} · F8</button><button className={`header-button download-button ${activeTasks.length > 0 || downloadPopoverOpen ? "selected" : ""}`} onClick={toggleHeaderDownloadPopover}>{headerDownloadLabel}</button><button className={`header-button proxy-button ${globalProxy.mode === "custom" ? "selected" : ""}`} onClick={openGlobalProxyEditor}>代理：{proxyModeLabel(globalProxy.mode)}</button><label className="font-scale-control"><span>字号</span><select aria-label="应用字号" value={fontScale} onChange={(event) => setFontScale(Number(event.target.value))}>{FONT_SCALE_OPTIONS.map((value) => <option key={value} value={value}>{Math.round(value * 100)}%</option>)}</select></label><span className="pane-count">{paneIds.length}/{MAX_PANES} 格</span><button className="header-button" onClick={() => void toggleFullscreen()}>{fullscreen ? "退出全屏" : "全屏"}</button><button className="header-button" onClick={() => void save()}>保存布局</button><button className="header-button subtle" onClick={() => void clearSession()}>清除登录</button></div>{globalProxyOpen && <div className="proxy-popover global-proxy-popover" onPointerDown={(event) => event.stopPropagation()} role="dialog" aria-label="全局代理设置"><div className="proxy-popover-title">全局代理设置</div><div className="proxy-form-hint">仅影响 Electron 内嵌分屏，不改变外部 Chrome 的网络设置。</div><label className="proxy-mode-field">代理模式<select value={globalProxyDraft.mode} onChange={(event) => setGlobalProxyDraft((current) => ({ ...current, mode: event.target.value as GlobalProxySettings["mode"] }))}><option value="system">系统代理</option><option value="direct">直连（不使用代理）</option><option value="custom">自定义 HTTP</option></select></label>{globalProxyDraft.mode === "custom" && <><label className="proxy-checkbox"><input type="checkbox" checked={globalProxyDraft.mode === "custom"} onChange={(event) => setGlobalProxyDraft((current) => ({ ...current, mode: event.target.checked ? "custom" : "direct" }))} />使用代理服务器</label><ProxyEndpointFields value={globalProxyDraft.custom} onChange={(custom) => setGlobalProxyDraft((current) => ({ ...current, custom }))} /></>}{globalProxyError && <div className="proxy-form-error">{globalProxyError}</div>}<div className="proxy-form-actions"><button className="icon-button" onClick={() => { setGlobalProxyOpen(false); setGlobalProxyError(null); }}>取消</button><button className="icon-button primary" onClick={() => void saveGlobalProxy()}>保存</button></div></div>}</header>
-       <div className="toolbar"><span className="toolbar-label">布局</span><div className="preset-group">{(["single", "split-2", "split-3", "grid-2x2", "grid-3x2"] as Preset[]).map((preset) => <button key={preset} className="preset-button" onClick={() => applyPreset(preset)}>{presetLabel(preset)}</button>)}</div><div className="toolbar-hint">{interactionMode === "web" ? "网页播放器直接接收鼠标和键盘 · F8 切换应用层" : "应用层接管活动分屏 · 鼠标移到底部显示控制"}</div></div>
+       <header className="app-header"><div className="brand"><div className="brand-mark">▦</div><div><div className="brand-title">同屏播放</div><div className="brand-subtitle">沉浸式多视频工作台</div></div></div><div className="header-actions"><span className={`interaction-mode ${interactionMode}`}>{interactionMode === "web" ? "网页操作" : "应用操作"}</span><button className="header-button" onClick={toggleInputMode}>{interactionMode === "web" ? "切到应用层" : "切回网页层"} · F8</button><button className={`header-button download-button ${activeTasks.length > 0 || downloadPopoverOpen ? "selected" : ""}`} onClick={toggleHeaderDownloadPopover}>{headerDownloadLabel}</button><button className={`header-button proxy-button ${globalProxy.mode === "custom" ? "selected" : ""}`} onClick={openGlobalProxyEditor}>代理：{proxyModeLabel(globalProxy.mode)}</button><div className="font-scale-wrapper"><label className="font-scale-control"><span>字号</span><select aria-label="应用字号" value={String(fontScale)} onChange={(event) => { if (event.target.value === CUSTOM_FONT_SCALE_VALUE) { setCustomFontScaleInput(String(Math.round(fontScale * 100))); setCustomFontScaleOpen(true); return; } setCustomFontScaleOpen(false); setFontScale(Number(event.target.value)); }}>{!FONT_SCALE_OPTIONS.includes(fontScale) && <option value={String(fontScale)}>{Math.round(fontScale * 100)}%</option>}{FONT_SCALE_OPTIONS.map((value) => <option key={value} value={String(value)}>{Math.round(value * 100)}%</option>)}<option value={CUSTOM_FONT_SCALE_VALUE}>自定义…</option></select></label>{customFontScaleOpen && <div className="proxy-popover custom-font-popover" role="dialog" aria-label="自定义字号" onPointerDown={(event) => event.stopPropagation()}><div className="custom-grid-title"><span>自定义应用字号</span><span className="custom-grid-preview-label">50% – 250%</span></div><div className="custom-font-row"><input type="number" min={50} max={250} step={5} aria-label="自定义字号百分比" value={customFontScaleInput} onChange={(event) => setCustomFontScaleInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") applyCustomFontScale(); }} /><span className="custom-font-unit">%</span><button type="button" className="icon-button primary" onClick={applyCustomFontScale}>应用</button></div></div>}</div><span className="pane-count">{paneIds.length} 格</span><button className="header-button" onClick={() => void toggleFullscreen()}>{fullscreen ? "退出全屏" : "全屏"}</button><button className="header-button" onClick={() => void save()}>保存布局</button><button className="header-button subtle" onClick={() => void clearSession()}>清除登录</button></div>{globalProxyOpen && <div className="proxy-popover global-proxy-popover" onPointerDown={(event) => event.stopPropagation()} role="dialog" aria-label="全局代理设置"><div className="proxy-popover-title">全局代理设置</div><div className="proxy-form-hint">仅影响 Electron 内嵌分屏，不改变外部 Chrome 的网络设置。</div><label className="proxy-mode-field">代理模式<select value={globalProxyDraft.mode} onChange={(event) => setGlobalProxyDraft((current) => ({ ...current, mode: event.target.value as GlobalProxySettings["mode"] }))}><option value="system">系统代理</option><option value="direct">直连（不使用代理）</option><option value="custom">自定义 HTTP</option></select></label>{globalProxyDraft.mode === "custom" && <><label className="proxy-checkbox"><input type="checkbox" checked={globalProxyDraft.mode === "custom"} onChange={(event) => setGlobalProxyDraft((current) => ({ ...current, mode: event.target.checked ? "custom" : "direct" }))} />使用代理服务器</label><ProxyEndpointFields value={globalProxyDraft.custom} onChange={(custom) => setGlobalProxyDraft((current) => ({ ...current, custom }))} /></>}{globalProxyError && <div className="proxy-form-error">{globalProxyError}</div>}<div className="proxy-form-actions"><button className="icon-button" onClick={() => { setGlobalProxyOpen(false); setGlobalProxyError(null); }}>取消</button><button className="icon-button primary" onClick={() => void saveGlobalProxy()}>保存</button></div></div>}</header>
+       <div className="toolbar">
+         <span className="toolbar-label">布局</span>
+         <div className="preset-group">
+           {(["single", "split-2", "split-3", "grid-2x2", "grid-3x2"] as Preset[]).map((preset) => (
+             <button key={preset} className="preset-button" onClick={() => applyPreset(preset)}>{presetLabel(preset)}</button>
+           ))}
+           <div className="custom-grid-wrapper">
+             <button
+               className={`preset-button custom-grid-button ${customGridOpen ? "selected" : ""}`}
+               onClick={() => {
+                 setCustomGridHover(null);
+                 setCustomGridOpen((current) => !current);
+               }}
+             >
+               自定义
+             </button>
+             {customGridOpen && (
+               <div
+                 className="proxy-popover custom-grid-popover"
+                 role="dialog"
+                 aria-label="自定义分屏布局"
+                 onPointerDown={(event) => event.stopPropagation()}
+               >
+                 <div className="custom-grid-title">
+                   <span>自定义列 × 行</span>
+                   <span className="custom-grid-preview-label">
+                     {customGridHover
+                       ? `${customGridHover.columns} × ${customGridHover.rows}（共 ${customGridHover.columns * customGridHover.rows} 格）`
+                       : `${Math.max(1, Number(customGridColumns) || 1)} × ${Math.max(1, Number(customGridRows) || 1)}`}
+                   </span>
+                 </div>
+                 <div
+                   className="custom-grid-matrix"
+                   onMouseLeave={() => setCustomGridHover(null)}
+                 >
+                   {[1, 2, 3, 4, 5, 6].map((row) =>
+                     [1, 2, 3, 4, 5, 6].map((col) => {
+                       const active = Boolean(customGridHover && col <= customGridHover.columns && row <= customGridHover.rows);
+                       return (
+                         <button
+                           key={`${col}x${row}`}
+                           type="button"
+                           className={`custom-grid-cell ${active ? "active" : ""}`}
+                           aria-label={`${col} 列 ${row} 行`}
+                           onMouseEnter={() => setCustomGridHover({ columns: col, rows: row })}
+                           onClick={() => applyCustomGrid(col, row)}
+                         />
+                       );
+                     })
+                   )}
+                 </div>
+                 <div className="custom-grid-inputs">
+                   <label>
+                     列
+                     <input
+                       type="number"
+                       min={1}
+                       step={1}
+                       aria-label="自定义列数"
+                       value={customGridColumns}
+                       onChange={(event) => setCustomGridColumns(event.target.value)}
+                       onKeyDown={(event) => {
+                         if (event.key === "Enter") submitCustomGridInputs();
+                       }}
+                     />
+                   </label>
+                   <span className="custom-grid-times">×</span>
+                   <label>
+                     行
+                     <input
+                       type="number"
+                       min={1}
+                       step={1}
+                       aria-label="自定义行数"
+                       value={customGridRows}
+                       onChange={(event) => setCustomGridRows(event.target.value)}
+                       onKeyDown={(event) => {
+                         if (event.key === "Enter") submitCustomGridInputs();
+                       }}
+                     />
+                   </label>
+                   <button type="button" className="icon-button primary" onClick={submitCustomGridInputs}>
+                     应用
+                   </button>
+                 </div>
+               </div>
+             )}
+           </div>
+         </div>
+         <div className="toolbar-hint">{interactionMode === "web" ? "网页播放器直接接收鼠标和键盘 · F8 切换应用层" : "应用层接管活动分屏 · 鼠标移到底部显示控制"}</div>
+       </div>
        <main className="workspace">{guestPreloadUrl ? <LayoutSurface layout={layout} runtimes={runtimes} activePaneId={activePaneId} activeDownloadProgressByPane={activeDownloadProgressByPane} interactionMode={interactionMode} debugOverlays={debugOverlays} guestPreloadUrl={guestPreloadUrl} onActive={setActivePaneId} onNavigate={navigate} onUpdatePane={updatePane} onProxyChange={updatePaneProxy} onResize={resizeDivider} onSwap={swapPanes} onSplit={split} onRemove={closePane} onOpenChrome={(paneId) => void openChrome(paneId)} onDownloadPane={openPaneDownload} /> : <div className="loading-state">正在准备网页播放内核…</div>}</main>
        <footer className="status-bar"><span className="status-dot" /><span>{status}</span><span className="status-spacer" /><span>全局代理：{proxyModeLabel(globalProxy.mode)} · 共享会话 · 安全拦截</span></footer>
       {downloadPopoverOpen && (
@@ -1740,16 +1968,18 @@ export default function App(): ReactElement {
               <div className="download-task-list">
                 {downloadState.tasks.map((task) => {
                   const activeTask = isActiveDownloadTask(task);
+                  const pausedTask = task.status === "paused";
+                  const canPause = task.status === "queued" || task.status === "downloading";
                   return (
                     <div key={task.id} className={`download-task-item ${task.status}`}>
                       <div className="download-task-top">
                         <span className="download-task-name" title={task.fileName}>{task.fileName}</span>
                         <span className="download-task-quality">{task.qualityLabel}</span>
                       </div>
-                      {activeTask && (
+                      {(activeTask || pausedTask) && (
                         <div className="download-progress-track">
                           <div
-                            className={`download-progress-fill ${task.progress === null ? "indeterminate" : ""}`}
+                            className={`download-progress-fill ${pausedTask ? "paused" : task.progress === null ? "indeterminate" : ""}`}
                             style={task.progress !== null ? { width: `${Math.min(100, Math.max(0, task.progress))}%` } : undefined}
                           />
                         </div>
@@ -1759,8 +1989,16 @@ export default function App(): ReactElement {
                           {formatTaskStatusText(task)}
                         </span>
                         <div className="download-task-actions">
-                          {activeTask ? (
-                            <button className="icon-button" onClick={() => void window.desktop.cancelDownloadTask(task.id)}>取消</button>
+                          {activeTask || pausedTask ? (
+                            <>
+                              {canPause && (
+                                <button className="icon-button" onClick={() => void window.desktop.pauseDownloadTask(task.id)}>暂停</button>
+                              )}
+                              {pausedTask && (
+                                <button className="icon-button primary" onClick={() => void window.desktop.resumeDownloadTask(task.id)}>继续</button>
+                              )}
+                              <button className="icon-button" onClick={() => void window.desktop.cancelDownloadTask(task.id)}>取消</button>
+                            </>
                           ) : (
                             <>
                               {task.status === "completed" && (

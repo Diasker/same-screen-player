@@ -11,9 +11,13 @@ import {
   buildQualityOptions,
   formatEta,
   formatSpeed,
+  hasExtractableMediaInfo,
+  normalizeDownloadProbeUrl,
   parseYtDlpProgressLine,
   resolveYtDlpProxyUrl,
   sanitizeDownloadFileName,
+  selectConcurrentFormats,
+  type ConcurrentFormatSelection,
   type CookieInput,
   type DownloadProbeResult,
   type DownloadQualityOption,
@@ -22,10 +26,13 @@ import {
   type DownloadTask,
   type DownloadToolStatus,
   type RawYtDlpFormat,
+  type ResolvedStreamSpec,
   type ToolBinaryInfo,
 } from "../src/shared/downloads";
 import type { GlobalProxySettings } from "../src/shared/types";
 import { loadDownloadSettings, saveDownloadSettings, type DownloadSettings } from "./download-settings";
+import { isKnownAdRequest } from "./ad-navigation";
+import { RangeHttpError, RangeUrlExpiredError, SingleStreamTransfer } from "./range-downloader";
 import { extractZipEntry } from "./zip-extract";
 
 type DownloadManagerOptions = {
@@ -36,6 +43,7 @@ type DownloadManagerOptions = {
   userAgent: string;
   fetchWithProxy: (url: string, options: { signal: AbortSignal }) => Promise<Response>;
   getPaneIdByWebContentsId?: (webContentsId: number) => string | undefined;
+  isAdUrl?: (url: string, sourceUrl: string, resourceType: string) => boolean;
   onStateChanged: (snapshot: DownloadStateSnapshot) => void;
   spawnProcess?: typeof spawn;
 };
@@ -45,18 +53,169 @@ type FrameInspection = {
   title: string;
   videos: Array<{
     src: string;
+    isBlob: boolean;
+    width: number;
+    height: number;
     area: number;
     duration: number;
+    visible: boolean;
+    playing?: boolean;
   }>;
+};
+
+type ObservedMediaEntry = {
+  url: string;
+  refererUrl: string;
+  frameUrl: string;
+  kind: "playlist" | "media";
+  firstObservedAt: number;
+  lastObservedAt: number;
+  hits: number;
+  adFlagged: boolean;
 };
 
 type ActiveController = {
   cancel: () => void;
+  pause?: () => void;
+  resume?: () => void;
+};
+
+type ProbedMediaCacheEntry = {
+  formats: RawYtDlpFormat[];
+  httpHeaders?: Record<string, string>;
+  cachedAt: number;
 };
 
 const MAX_TASKS_HISTORY = 40;
+const MAX_OBSERVED_MEDIA = 32;
+const MAX_PROBED_MEDIA_CACHE = 20;
+const PROBED_MEDIA_CACHE_TTL_MS = 15 * 60 * 1000;
+const OBSERVED_MEDIA_TTL_MS = 10 * 60 * 1000;
 const PROGRESS_THROTTLE_MS = 160;
 const PROBE_TIMEOUT_MS = 25000;
+
+async function writeChunkWithBackpressure(
+  writer: ReturnType<typeof createWriteStream>,
+  chunk: Uint8Array
+): Promise<void> {
+  if (writer.write(chunk)) return;
+  await new Promise<void>((resolve, reject) => {
+    const onDrain = () => {
+      writer.off("error", onError);
+      resolve();
+    };
+    const onError = (error: Error) => {
+      writer.off("drain", onDrain);
+      reject(error);
+    };
+    writer.once("drain", onDrain);
+    writer.once("error", onError);
+  });
+}
+
+function normalizeNavigationKey(rawUrl: string): string | null {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return `${parsed.origin}${parsed.pathname}${parsed.search}`;
+  } catch {
+    return null;
+  }
+}
+
+function getResponseHeader(headers: Record<string, string[]> | undefined, name: string): string | null {
+  if (!headers) return null;
+  const target = name.toLowerCase();
+  for (const [key, values] of Object.entries(headers)) {
+    if (key.toLowerCase() === target && Array.isArray(values) && values.length > 0) {
+      return values[0] ?? null;
+    }
+  }
+  return null;
+}
+
+function parseTotalSizeFromHeaders(headers: Record<string, string[]> | undefined): number | null {
+  const contentRange = getResponseHeader(headers, "content-range");
+  if (contentRange) {
+    const match = contentRange.match(/\/(\d+)\s*$/);
+    if (match) {
+      const total = Number(match[1]);
+      if (Number.isFinite(total) && total > 0) return total;
+    }
+  }
+  const contentLength = getResponseHeader(headers, "content-length");
+  if (contentLength) {
+    const total = Number(contentLength);
+    if (Number.isFinite(total) && total > 0) return total;
+  }
+  return null;
+}
+
+function isDedicatedExtractorHost(rawUrl: string): boolean {
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase();
+    const dedicated = [
+      "bilibili.com",
+      "b23.tv",
+      "youtube.com",
+      "youtu.be",
+      "twitch.tv",
+      "nicovideo.jp",
+      "vimeo.com",
+      "dailymotion.com",
+      "tiktok.com",
+      "douyin.com",
+      "ixigua.com",
+      "acfun.cn",
+      "youku.com",
+      "iqiyi.com",
+      "v.qq.com",
+      "mgtv.com",
+      "pornhub.com",
+      "xvideos.com",
+      "xhamster.com",
+      "spankbang.com",
+      "twitter.com",
+      "x.com",
+      "instagram.com",
+      "facebook.com",
+      "reddit.com",
+    ];
+    return dedicated.some((domain) => host === domain || host.endsWith(`.${domain}`));
+  } catch {
+    return false;
+  }
+}
+
+function isMasterPlaylistUrl(url: string): boolean {
+  return /(?:^|\/)(?:master|playlist|index|manifest)[^/]*\.(?:m3u8|mpd)(?:$|\?)/i.test(url) || /\.mpd(?:$|\?)/i.test(url);
+}
+
+function isSubPlaylistUrl(url: string): boolean {
+  return /(?:^|[/_-])(?:144|240|360|480|720|1080|1440|2160)p\b|chunklist|playlistType=standard|subtitles?|audio(?:_only)?/i.test(url);
+}
+
+function isLikelyAdMedia(
+  url: string,
+  contextUrl = "",
+  width = 0,
+  height = 0,
+  duration = 0,
+  frameUrl = ""
+): boolean {
+  if (isKnownAdRequest(url) || (contextUrl && isKnownAdRequest(contextUrl)) || (frameUrl && isKnownAdRequest(frameUrl))) {
+    return true;
+  }
+  const combined = `${url} ${contextUrl} ${frameUrl}`;
+  if (/\b(?:banner|smartpop|popunder|vast|preroll|midroll)\b|pornfhd\.com|storagexhd\.com|growcdnssedge\.com|myavlive\.com|mavrtracktor\.com|mayzaent\.com|marzaent\.com|greentrafsa\.com|gasipedibexide\.com|bestjavporn\.live|javhd-trk\.com|tsyndicate\.com|magsrv\.com|stripcash|exoclick|juicyads|trafficjunky|whitetrafsa\.com|snaptrckr\.fun|wheelroot\.com|nomandswitch\.cc|udzpel\.com|alaphoid\.com/i.test(combined)) {
+    return true;
+  }
+  if (/\b(?:300x250|728x90|160x600|320x100|320x50|300x100|440x250)\b/i.test(url)) return true;
+  if (width > 0 && height > 0 && width <= 360 && height <= 280 && duration > 0 && duration <= 45) {
+    return true;
+  }
+  return false;
+}
 
 function isHttpUrl(value: unknown): value is string {
   if (typeof value !== "string" || value.length > 4096) return false;
@@ -122,6 +281,15 @@ function killProcessTree(child: ChildProcess): void {
 
 function translateYtDlpError(stderrText: string, hasFfmpeg: boolean): string {
   const lower = stderrText.toLowerCase();
+  if (lower.includes("unusual and will be skipped for safety reasons")) {
+    return "解析到的目标不是有效视频流（检测到网页文件），请确认分屏正在播放具体视频后重新解析";
+  }
+  if (lower.includes("geo-restricted")) {
+    return "该视频存在地区限制，请尝试切换代理节点后重试";
+  }
+  if (lower.includes("http error 412") || lower.includes("412: precondition failed")) {
+    return "站点触发风控拦截 (412)，请先在分屏内刷新或完成验证后再试";
+  }
   if (lower.includes("ffmpeg is not installed") || lower.includes("ffmpeg not found")) {
     return "该清晰度需要 ffmpeg 合并音视频，请先安装或指定 ffmpeg";
   }
@@ -190,6 +358,9 @@ export class DownloadManager {
   private readonly activeProbes = new Map<string, () => void>();
   private readonly reservedPaths = new Set<string>();
   private readonly attachedSessions = new WeakSet<Session>();
+  private readonly observedMedia = new Map<number, ObservedMediaEntry[]>();
+  private readonly observedPageKeys = new Map<number, string>();
+  private readonly probedMediaCache = new Map<string, ProbedMediaCacheEntry>();
   private installAbort: AbortController | null = null;
   private toolStatus: DownloadToolStatus;
   private lastBroadcastAt = new Map<string, number>();
@@ -208,6 +379,151 @@ export class DownloadManager {
   async initialize(): Promise<void> {
     this.settings = await loadDownloadSettings(this.settingsFile);
     await this.refreshToolStatus();
+  }
+
+  private isAdFlagged(url: string, sourceUrl: string, resourceType: string): boolean {
+    try {
+      return Boolean(this.options.isAdUrl?.(url, sourceUrl, resourceType));
+    } catch {
+      return false;
+    }
+  }
+
+  private logDiagnostic(event: string, data: Record<string, unknown>): void {
+    const entry = {
+      timestamp: new Date().toISOString(),
+      event,
+      ...data,
+    };
+    const logPath = path.join(this.options.userDataDir, "download-diagnostics.log");
+    void fs.appendFile(logPath, `${JSON.stringify(entry)}\n`, "utf8").catch(() => undefined);
+  }
+
+  handlePaneNavigation(webContentsId: number, pageUrl: string): void {
+    const key = normalizeNavigationKey(pageUrl);
+    if (!key) return;
+    const prevKey = this.observedPageKeys.get(webContentsId);
+    this.observedPageKeys.set(webContentsId, key);
+    if (prevKey !== undefined && prevKey !== key) {
+      this.observedMedia.delete(webContentsId);
+    }
+  }
+
+  observeCompletedRequest(details: {
+    url: string;
+    webContentsId?: number;
+    resourceType: string;
+    statusCode: number;
+    referrer?: string;
+    frameUrl?: string;
+    responseHeaders?: Record<string, string[]>;
+  }): void {
+    const wcId = details.webContentsId;
+    if (typeof wcId !== "number" || wcId < 0 || !isHttpUrl(details.url)) return;
+    if (details.statusCode < 200 || details.statusCode >= 400) return;
+
+    if (details.resourceType === "mainFrame") {
+      const key = normalizeNavigationKey(details.url);
+      if (key) this.observedPageKeys.set(wcId, key);
+      this.observedMedia.delete(wcId);
+      return;
+    }
+
+    const frameUrl = isHttpUrl(details.frameUrl) ? details.frameUrl : "";
+    const refererUrl = isHttpUrl(details.referrer) ? details.referrer : frameUrl;
+    if (isLikelyAdMedia(details.url, refererUrl, 0, 0, 0, frameUrl)) return;
+
+    let pathname = "";
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(details.url);
+      pathname = parsedUrl.pathname.toLowerCase();
+    } catch {
+      return;
+    }
+    const contentType = (getResponseHeader(details.responseHeaders, "content-type") ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
+
+    const isPlaylist =
+      pathname.endsWith(".m3u8")
+      || pathname.endsWith(".mpd")
+      || /(?:^|[/?&=])[^/]*\.(?:m3u8|mpd)(?:$|&)/i.test(details.url)
+      || contentType === "application/vnd.apple.mpegurl"
+      || contentType === "application/x-mpegurl"
+      || contentType === "audio/mpegurl"
+      || contentType === "application/dash+xml";
+
+    const looksLikeMediaSegment =
+      details.resourceType !== "media"
+      && (
+        /(?:^|[/_-])(?:init|seg|segment|frag|chunk)[_-]?\d*\.(?:mp4|m4s|m4v)$|_\d{3,6}_[A-Za-z0-9]+_\d+\.mp4$/i.test(pathname)
+        || parsedUrl.searchParams.has("range")
+        || parsedUrl.searchParams.has("sq")
+      );
+
+    const isMedia =
+      !isPlaylist
+      && !looksLikeMediaSegment
+      && (
+        /^video\/(?:mp4|webm|quicktime|ogg|x-matroska|x-m4v)$/.test(contentType)
+        || (details.resourceType === "media" && /\.(?:mp4|webm|mov|m4v|ogv|mkv)$/.test(pathname))
+      );
+
+    if (!isPlaylist && !isMedia) return;
+
+    if (isMedia) {
+      const totalSize = parseTotalSizeFromHeaders(details.responseHeaders);
+      if (totalSize !== null && totalSize < 256 * 1024) return;
+    }
+
+    const now = Date.now();
+    const adFlagged =
+      this.isAdFlagged(details.url, refererUrl || frameUrl || details.url, details.resourceType)
+      || Boolean(frameUrl && this.isAdFlagged(frameUrl, details.url, "subFrame"));
+
+    const existingList = (this.observedMedia.get(wcId) ?? []).filter(
+      (entry) => now - entry.lastObservedAt < OBSERVED_MEDIA_TTL_MS
+    );
+    const existingIndex = existingList.findIndex((entry) => entry.url === details.url);
+    if (existingIndex >= 0) {
+      const existing = existingList[existingIndex];
+      existingList[existingIndex] = {
+        ...existing,
+        refererUrl: refererUrl || existing.refererUrl,
+        frameUrl: frameUrl || existing.frameUrl,
+        lastObservedAt: now,
+        hits: existing.hits + 1,
+        adFlagged: existing.adFlagged || adFlagged,
+      };
+    } else {
+      existingList.push({
+        url: details.url,
+        refererUrl,
+        frameUrl,
+        kind: isPlaylist ? "playlist" : "media",
+        firstObservedAt: now,
+        lastObservedAt: now,
+        hits: 1,
+        adFlagged,
+      });
+      if (existingList.length > MAX_OBSERVED_MEDIA) {
+        existingList.sort((a, b) => Number(a.adFlagged) - Number(b.adFlagged) || a.firstObservedAt - b.firstObservedAt);
+        existingList.shift();
+      }
+    }
+    this.observedMedia.set(wcId, existingList);
+    this.logDiagnostic("observe", {
+      wcId,
+      kind: isPlaylist ? "playlist" : "media",
+      url: details.url,
+      frameUrl,
+      refererUrl,
+      adFlagged,
+    });
+  }
+
+  clearObservedMedia(webContentsId: number): void {
+    this.observedMedia.delete(webContentsId);
+    this.observedPageKeys.delete(webContentsId);
   }
 
   getDownloadDir(): string {
@@ -468,12 +784,7 @@ export class DownloadManager {
         if (done) break;
         if (value) {
           received += value.byteLength;
-          if (!writer.write(value)) {
-            await new Promise<void>((resolve, reject) => {
-              writer.once("drain", resolve);
-              writer.once("error", reject);
-            });
-          }
+          await writeChunkWithBackpressure(writer, value);
           const now = Date.now();
           if (now - lastEmit >= PROGRESS_THROTTLE_MS) {
             lastEmit = now;
@@ -501,6 +812,8 @@ export class DownloadManager {
     pageTitle: string;
     videoFrameUrl?: string;
     directVideoUrl?: string;
+    directVideoReferer?: string;
+    activeFrameUrls: string[];
   }> {
     const pageUrl = contents.getURL();
     const pageTitle = contents.getTitle() || "";
@@ -514,12 +827,20 @@ export class DownloadManager {
 
     const script = `(() => {
       const videos = Array.from(document.querySelectorAll('video')).map((video) => {
+        const style = window.getComputedStyle(video);
         const rect = video.getBoundingClientRect();
-        const src = video.currentSrc || video.src || '';
+        const src = video.currentSrc || video.src || video.querySelector('source')?.src || '';
+        const visible = !video.hidden && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0 && rect.width > 2 && rect.height > 2;
+        const playing = !video.paused && !video.ended && video.readyState >= 2;
         return {
           src: /^https?:/i.test(src) ? src : '',
+          isBlob: /^blob:/i.test(src),
+          width: Math.max(0, rect.width),
+          height: Math.max(0, rect.height),
           area: Math.max(0, rect.width * rect.height),
           duration: Number.isFinite(video.duration) ? video.duration : 0,
+          visible,
+          playing,
         };
       });
       return {
@@ -544,30 +865,66 @@ export class DownloadManager {
       })
     );
 
-    let bestVideoUrl: string | undefined;
-    let bestVideoArea = -1;
+    let bestPrimaryScore = -1;
+    let primaryFrameUrl: string | undefined;
+    let primaryDirectUrl: string | undefined;
+    let primaryIsBlob = false;
+    let bestDirectUrl: string | undefined;
+    let bestDirectReferer: string | undefined;
+    let bestDirectScore = -1;
     let videoFrameUrl: string | undefined;
-    let bestFrameArea = -1;
+    let bestFrameScore = -1;
 
+    const activeFrameUrls: string[] = [];
     for (const item of inspections) {
-      if (!item || !Array.isArray(item.videos)) continue;
+      if (!item) continue;
+      if (isHttpUrl(item.frameUrl) && !activeFrameUrls.includes(item.frameUrl)) {
+        activeFrameUrls.push(item.frameUrl);
+      }
+      if (!Array.isArray(item.videos)) continue;
       for (const video of item.videos) {
-        if (video.src && isHttpUrl(video.src) && video.area >= bestVideoArea) {
-          bestVideoArea = video.area;
-          bestVideoUrl = video.src;
+        if (isLikelyAdMedia(video.src || "", item.frameUrl, video.width, video.height, video.duration, item.frameUrl)) {
+          continue;
         }
-        if (item.frameUrl !== pageUrl && isHttpUrl(item.frameUrl) && video.area >= bestFrameArea) {
-          bestFrameArea = video.area;
+        const durationBonus = video.duration > 60 ? 1_000_000 : video.duration > 15 ? 100_000 : 0;
+        const visibleBonus = video.visible ? 2_000_000 : 0;
+        const playingBonus = video.playing ? 500_000 : 0;
+        const visibilityFactor = video.visible ? 1 : 0.1;
+        const adPenalty =
+          (video.src && this.isAdFlagged(video.src, item.frameUrl || pageUrl, "media"))
+          || (item.frameUrl && item.frameUrl !== pageUrl && this.isAdFlagged(item.frameUrl, pageUrl, "subFrame"))
+            ? -500_000
+            : 0;
+        const score = (video.area * visibilityFactor) + visibleBonus + playingBonus + durationBonus + adPenalty;
+
+        if (score >= bestPrimaryScore) {
+          bestPrimaryScore = score;
+          primaryFrameUrl = isHttpUrl(item.frameUrl) ? item.frameUrl : undefined;
+          primaryDirectUrl = video.src && isHttpUrl(video.src) ? video.src : undefined;
+          primaryIsBlob = Boolean(video.isBlob && !primaryDirectUrl);
+        }
+        if (video.src && isHttpUrl(video.src) && score >= bestDirectScore) {
+          bestDirectScore = score;
+          bestDirectUrl = video.src;
+          bestDirectReferer = isHttpUrl(item.frameUrl) ? item.frameUrl : pageUrl;
+        }
+        if (item.frameUrl !== pageUrl && isHttpUrl(item.frameUrl) && score >= bestFrameScore) {
+          bestFrameScore = score;
           videoFrameUrl = item.frameUrl;
         }
       }
     }
 
+    const directVideoUrl = primaryIsBlob ? undefined : (primaryDirectUrl ?? bestDirectUrl);
+    const directVideoReferer = primaryIsBlob ? undefined : (primaryDirectUrl ? (primaryFrameUrl ?? pageUrl) : bestDirectReferer);
+
     return {
       pageUrl,
       pageTitle,
       videoFrameUrl,
-      directVideoUrl: bestVideoUrl,
+      directVideoUrl,
+      directVideoReferer,
+      activeFrameUrls,
     };
   }
 
@@ -630,61 +987,236 @@ export class DownloadManager {
       };
     }
 
-    if (!tools.ytDlp.path) {
-      if (inspected.directVideoUrl) {
+    const now = Date.now();
+    const observedEntries = (typeof contents.id === "number" ? this.observedMedia.get(contents.id) ?? [] : [])
+      .filter((entry) => now - entry.lastObservedAt < OBSERVED_MEDIA_TTL_MS);
+    const activeFrameSet = new Set(
+      inspected.activeFrameUrls
+        .map((url) => normalizeNavigationKey(url) ?? url)
+        .filter(Boolean)
+    );
+    const isFromStaleFrame = (entry: ObservedMediaEntry): boolean => {
+      if (!entry.frameUrl || activeFrameSet.size === 0) return false;
+      const key = normalizeNavigationKey(entry.frameUrl) ?? entry.frameUrl;
+      return !activeFrameSet.has(key);
+    };
+
+    const scoreObservedPlaylist = (entry: ObservedMediaEntry): number => {
+      let score = 0;
+      const pageOrigin = (() => {
+        try { return new URL(inspected.pageUrl).origin; } catch { return ""; }
+      })();
+      const frameOrigin = (() => {
+        try { return inspected.videoFrameUrl ? new URL(inspected.videoFrameUrl).origin : ""; } catch { return ""; }
+      })();
+      const contextMatchesExact =
+        entry.refererUrl === inspected.pageUrl
+        || (inspected.videoFrameUrl && entry.refererUrl === inspected.videoFrameUrl)
+        || entry.frameUrl === inspected.pageUrl
+        || (inspected.videoFrameUrl && entry.frameUrl === inspected.videoFrameUrl);
+      const contextMatchesOrigin = Boolean(
+        (pageOrigin && (entry.refererUrl.startsWith(pageOrigin) || entry.frameUrl.startsWith(pageOrigin)))
+        || (frameOrigin && (entry.refererUrl.startsWith(frameOrigin) || entry.frameUrl.startsWith(frameOrigin)))
+      );
+      if (contextMatchesExact) score += 1200;
+      else if (contextMatchesOrigin) score += 900;
+      else if (!entry.refererUrl) score -= 500;
+
+      if (isFromStaleFrame(entry)) score -= 2000;
+      if (isMasterPlaylistUrl(entry.url)) {
+        score += 400;
+      }
+      if (isSubPlaylistUrl(entry.url)) {
+        score -= 400;
+      }
+      if (entry.hits > 6) score -= 400;
+      if (entry.adFlagged) score -= 1200;
+      return score;
+    };
+
+    const observedPlaylists = observedEntries
+      .filter((entry) => entry.kind === "playlist")
+      .sort((a, b) => {
+        const scoreDiff = scoreObservedPlaylist(b) - scoreObservedPlaylist(a);
+        if (scoreDiff !== 0) return scoreDiff;
+        const sameMasterWindow =
+          Math.abs(a.firstObservedAt - b.firstObservedAt) <= 1_500
+          && !(isMasterPlaylistUrl(a.url) && isMasterPlaylistUrl(b.url));
+        if (sameMasterWindow) {
+          return a.firstObservedAt - b.firstObservedAt;
+        }
+        return b.lastObservedAt - a.lastObservedAt;
+      });
+    const observedDirectMedia = observedEntries
+      .filter((entry) => entry.kind === "media")
+      .sort(
+        (a, b) =>
+          Number(a.adFlagged) - Number(b.adFlagged)
+          || Number(isFromStaleFrame(a)) - Number(isFromStaleFrame(b))
+          || b.lastObservedAt - a.lastObservedAt
+      );
+
+    const fallbackDirectUrl = inspected.directVideoUrl ?? observedDirectMedia[0]?.url;
+    const fallbackDirectReferer = inspected.directVideoUrl
+      ? (inspected.directVideoReferer ?? inspected.pageUrl)
+      : (observedDirectMedia[0]?.refererUrl || inspected.videoFrameUrl || inspected.pageUrl);
+
+    const nonAdPlaylists = observedPlaylists.filter((entry) => !entry.adFlagged);
+    const liveFramePlaylists = nonAdPlaylists.filter((entry) => !isFromStaleFrame(entry));
+    const nonAdDirectMedia = observedDirectMedia.filter((entry) => !entry.adFlagged && !isFromStaleFrame(entry));
+    const hasInPagePlaylistSwitch =
+      liveFramePlaylists.length >= 2
+      && (
+        Math.abs(liveFramePlaylists[0].firstObservedAt - liveFramePlaylists[1].firstObservedAt) > 1_500
+        || (isMasterPlaylistUrl(liveFramePlaylists[0].url) && isMasterPlaylistUrl(liveFramePlaylists[1].url))
+      );
+    const isGenericPage = !isDedicatedExtractorHost(inspected.pageUrl);
+    const latestDirectAt = nonAdDirectMedia[0]?.lastObservedAt ?? 0;
+    const latestPlaylistAt = liveFramePlaylists[0]?.lastObservedAt ?? 0;
+    const preferLiveDirectVideo = Boolean(
+      isGenericPage
+      && inspected.directVideoUrl
+      && (
+        nonAdDirectMedia.length >= 2
+        || (nonAdPlaylists.length > 0 && (liveFramePlaylists.length === 0 || latestDirectAt >= latestPlaylistAt))
+      )
+    );
+
+    if (!tools.ytDlp.path || preferLiveDirectVideo) {
+      if (fallbackDirectUrl) {
+        this.logDiagnostic("probe:direct", {
+          probeId,
+          paneId,
+          pageUrl: inspected.pageUrl,
+          videoFrameUrl: inspected.videoFrameUrl,
+          directUrl: fallbackDirectUrl,
+          preferLiveDirectVideo,
+        });
         const suggestedName = sanitizeDownloadFileName(
-          inspected.pageTitle || path.basename(new URL(inspected.directVideoUrl).pathname) || "video"
+          inspected.pageTitle || path.basename(new URL(fallbackDirectUrl).pathname) || "video"
         );
-        const ext = inferExtensionFromUrl(inspected.directVideoUrl, "mp4");
+        const ext = inferExtensionFromUrl(fallbackDirectUrl, "mp4");
         return {
           ok: true,
           paneId,
           pageUrl: inspected.pageUrl,
-          probeUrl: inspected.directVideoUrl,
+          probeUrl: fallbackDirectUrl,
+          refererUrl: fallbackDirectReferer,
           title: inspected.pageTitle || suggestedName,
           suggestedName,
           sourceType: "direct",
-          directUrl: inspected.directVideoUrl,
+          directUrl: fallbackDirectUrl,
           qualities: [
             {
               id: "direct",
-              label: `原视频直链 (.${ext}) · 无需外部组件`,
+              label: `原视频直链 (.${ext})${!tools.ytDlp.path ? " · 无需外部组件" : ""}`,
               selector: "direct",
               ext,
               isDirect: true,
             },
           ],
+          hasYtDlp: tools.ytDlp.available,
+          hasFfmpeg,
+        };
+      }
+      if (!tools.ytDlp.path) {
+        return {
+          ok: false,
+          code: "missing-yt-dlp",
+          message: "下载 YouTube、bilibili 等流媒体视频需要先安装 yt-dlp 组件",
+          paneId,
+          pageUrl: inspected.pageUrl,
           hasYtDlp: false,
           hasFfmpeg,
         };
       }
-      return {
-        ok: false,
-        code: "missing-yt-dlp",
-        message: "下载 YouTube、bilibili 等流媒体视频需要先安装 yt-dlp 组件",
-        paneId,
-        pageUrl: inspected.pageUrl,
-        hasYtDlp: false,
-        hasFfmpeg,
-      };
     }
 
-    const candidates = [inspected.pageUrl];
-    if (inspected.videoFrameUrl && inspected.videoFrameUrl !== inspected.pageUrl) {
-      candidates.push(inspected.videoFrameUrl);
+    const candidates: Array<{ probeUrl: string; refererUrl: string; isPlaylist?: boolean }> = [];
+    const seenCandidates = new Set<string>();
+    const addCandidate = (probeUrl: string | undefined, refererUrl: string, isPlaylist = false) => {
+      if (!probeUrl || !isHttpUrl(probeUrl) || seenCandidates.has(probeUrl)) return;
+      seenCandidates.add(probeUrl);
+      candidates.push({ probeUrl, refererUrl, isPlaylist });
+    };
+    const normalizedPageUrl = normalizeDownloadProbeUrl(inspected.pageUrl);
+    const preferObservedPlaylists = Boolean(
+      isGenericPage
+      && liveFramePlaylists.length > 0
+      && (hasInPagePlaylistSwitch || !isSubPlaylistUrl(liveFramePlaylists[0].url))
+    );
+    if (isGenericPage) {
+      if (preferObservedPlaylists) {
+        for (const playlist of liveFramePlaylists.slice(0, 4)) {
+          addCandidate(playlist.url, playlist.refererUrl || inspected.videoFrameUrl || inspected.pageUrl, true);
+        }
+      }
+      if (inspected.videoFrameUrl && inspected.videoFrameUrl !== inspected.pageUrl) {
+        addCandidate(normalizeDownloadProbeUrl(inspected.videoFrameUrl), inspected.pageUrl);
+        addCandidate(inspected.videoFrameUrl, inspected.pageUrl);
+      }
+      if (!preferObservedPlaylists) {
+        for (const playlist of liveFramePlaylists.slice(0, 4)) {
+          addCandidate(playlist.url, playlist.refererUrl || inspected.videoFrameUrl || inspected.pageUrl, true);
+        }
+      }
+      addCandidate(normalizedPageUrl, normalizedPageUrl);
+      addCandidate(inspected.pageUrl, inspected.pageUrl);
+      for (const playlist of observedPlaylists.slice(0, 4)) {
+        addCandidate(playlist.url, playlist.refererUrl || inspected.videoFrameUrl || inspected.pageUrl, true);
+      }
+    } else {
+      addCandidate(normalizedPageUrl, normalizedPageUrl);
+      addCandidate(inspected.pageUrl, inspected.pageUrl);
+      if (inspected.videoFrameUrl && inspected.videoFrameUrl !== inspected.pageUrl) {
+        addCandidate(normalizeDownloadProbeUrl(inspected.videoFrameUrl), inspected.pageUrl);
+        addCandidate(inspected.videoFrameUrl, inspected.pageUrl);
+      }
+      for (const playlist of observedPlaylists.slice(0, 4)) {
+        addCandidate(playlist.url, playlist.refererUrl || inspected.videoFrameUrl || inspected.pageUrl, true);
+      }
     }
+
+    this.logDiagnostic("probe:plan", {
+      probeId,
+      paneId,
+      pageUrl: inspected.pageUrl,
+      videoFrameUrl: inspected.videoFrameUrl,
+      directVideoUrl: inspected.directVideoUrl,
+      activeFrameUrls: inspected.activeFrameUrls,
+      preferObservedPlaylists,
+      hasInPagePlaylistSwitch,
+      observedPlaylists: observedPlaylists.slice(0, 6).map((p) => ({
+        url: p.url,
+        frameUrl: p.frameUrl,
+        hits: p.hits,
+        stale: isFromStaleFrame(p),
+        score: scoreObservedPlaylist(p),
+        firstObservedAt: p.firstObservedAt,
+        lastObservedAt: p.lastObservedAt,
+      })),
+      candidates: candidates.map((c) => c.probeUrl),
+    });
 
     let lastErrorMessage = "无法解析当前页面的视频流";
-    for (const candidateUrl of candidates) {
+    for (const candidate of candidates) {
       const result = await this.runYtDlpProbe(
         probeId,
         tools.ytDlp.path,
-        candidateUrl,
-        inspected.pageUrl,
+        candidate.probeUrl,
+        candidate.refererUrl,
         targetSession,
         proxySettings,
         hasFfmpeg
       );
+      this.logDiagnostic("probe:candidate", {
+        probeId,
+        probeUrl: candidate.probeUrl,
+        ok: result.ok,
+        canceled: !result.ok ? result.canceled : false,
+        title: result.ok ? result.title : undefined,
+        message: !result.ok ? result.message : undefined,
+      });
       if (result.canceled) {
         return {
           ok: false,
@@ -697,13 +1229,20 @@ export class DownloadManager {
         };
       }
       if (result.ok) {
-        const title = result.title || inspected.pageTitle || "video";
+        this.cacheProbedFormats(candidate.probeUrl, result.formats, result.httpHeaders);
+        const cleanPageTitle = inspected.pageTitle.trim();
+        const usePageTitle =
+          candidate.isPlaylist
+          && cleanPageTitle.length > 0
+          && !/^(?:about:blank|loading|just a moment\.\.\.)$/i.test(cleanPageTitle);
+        const title = (usePageTitle ? cleanPageTitle : result.title) || cleanPageTitle || "video";
         const suggestedName = sanitizeDownloadFileName(title, "video");
         return {
           ok: true,
           paneId,
           pageUrl: inspected.pageUrl,
-          probeUrl: candidateUrl,
+          probeUrl: candidate.probeUrl,
+          refererUrl: candidate.refererUrl,
           title,
           suggestedName,
           sourceType: "yt-dlp",
@@ -716,18 +1255,19 @@ export class DownloadManager {
       lastErrorMessage = result.message;
     }
 
-    if (inspected.directVideoUrl) {
+    if (fallbackDirectUrl) {
       const suggestedName = sanitizeDownloadFileName(inspected.pageTitle || "video");
-      const ext = inferExtensionFromUrl(inspected.directVideoUrl, "mp4");
+      const ext = inferExtensionFromUrl(fallbackDirectUrl, "mp4");
       return {
         ok: true,
         paneId,
         pageUrl: inspected.pageUrl,
-        probeUrl: inspected.directVideoUrl,
+        probeUrl: fallbackDirectUrl,
+        refererUrl: fallbackDirectReferer,
         title: inspected.pageTitle || suggestedName,
         suggestedName,
         sourceType: "direct",
-        directUrl: inspected.directVideoUrl,
+        directUrl: fallbackDirectUrl,
         qualities: [
           {
             id: "direct",
@@ -742,15 +1282,38 @@ export class DownloadManager {
       };
     }
 
+    const finalMessage =
+      lastErrorMessage === "暂不支持解析该网页地址" && observedPlaylists.length === 0
+        ? "暂不支持直接解析该网页；如果页面需先点击播放才会加载视频，请先在分屏内点击播放后再点“重新解析”"
+        : lastErrorMessage;
+
     return {
       ok: false,
       code: "failed",
-      message: lastErrorMessage,
+      message: finalMessage,
       paneId,
       pageUrl: inspected.pageUrl,
       hasYtDlp: true,
       hasFfmpeg,
     };
+  }
+
+  private cacheProbedFormats(
+    probeUrl: string,
+    formats: RawYtDlpFormat[],
+    httpHeaders?: Record<string, string>
+  ): void {
+    this.probedMediaCache.delete(probeUrl);
+    this.probedMediaCache.set(probeUrl, {
+      formats,
+      httpHeaders,
+      cachedAt: Date.now(),
+    });
+    while (this.probedMediaCache.size > MAX_PROBED_MEDIA_CACHE) {
+      const oldestKey = this.probedMediaCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.probedMediaCache.delete(oldestKey);
+    }
   }
 
   private async runYtDlpProbe(
@@ -762,7 +1325,15 @@ export class DownloadManager {
     proxySettings: GlobalProxySettings,
     hasFfmpeg: boolean
   ): Promise<
-    | { ok: true; canceled?: false; title?: string; duration?: number; qualities: DownloadQualityOption[] }
+    | {
+        ok: true;
+        canceled?: false;
+        title?: string;
+        duration?: number;
+        qualities: DownloadQualityOption[];
+        formats: RawYtDlpFormat[];
+        httpHeaders?: Record<string, string>;
+      }
     | { ok: false; canceled: boolean; message: string }
   > {
     const helpers = await this.prepareSessionHelpers(targetSession, targetUrl, proxySettings);
@@ -797,7 +1368,15 @@ export class DownloadManager {
 
       const finish = (
         value:
-          | { ok: true; canceled?: false; title?: string; duration?: number; qualities: DownloadQualityOption[] }
+          | {
+              ok: true;
+              canceled?: false;
+              title?: string;
+              duration?: number;
+              qualities: DownloadQualityOption[];
+              formats: RawYtDlpFormat[];
+              httpHeaders?: Record<string, string>;
+            }
           | { ok: false; canceled: boolean; message: string }
       ) => {
         if (settled) return;
@@ -844,12 +1423,29 @@ export class DownloadManager {
           const parsed = JSON.parse(stdout) as {
             title?: unknown;
             duration?: unknown;
+            ext?: unknown;
+            http_headers?: unknown;
             formats?: RawYtDlpFormat[];
           };
+          if (!hasExtractableMediaInfo(parsed)) {
+            finish({
+              ok: false,
+              canceled: false,
+              message: "未能识别到可下载的视频流（仅检测到网页链接），请确认当前页面正在播放具体视频",
+            });
+            return;
+          }
           const title = typeof parsed.title === "string" ? parsed.title : undefined;
           const duration = typeof parsed.duration === "number" && Number.isFinite(parsed.duration) ? parsed.duration : undefined;
-          const qualities = buildQualityOptions(Array.isArray(parsed.formats) ? parsed.formats : [], hasFfmpeg, duration);
-          finish({ ok: true, title, duration, qualities });
+          const formats = Array.isArray(parsed.formats) ? parsed.formats : [];
+          const httpHeaders: Record<string, string> = {};
+          if (parsed.http_headers && typeof parsed.http_headers === "object") {
+            for (const [key, val] of Object.entries(parsed.http_headers as Record<string, unknown>)) {
+              if (typeof val === "string") httpHeaders[key] = val;
+            }
+          }
+          const qualities = buildQualityOptions(formats, hasFfmpeg, duration);
+          finish({ ok: true, title, duration, qualities, formats, httpHeaders });
         } catch {
           finish({ ok: false, canceled: false, message: "解析视频信息失败（返回格式无效）" });
         }
@@ -921,6 +1517,69 @@ export class DownloadManager {
     }
   }
 
+  private cleanupPartFilesLater(reservedPath: string): void {
+    const prefix = `${path.parse(reservedPath).name}.`;
+    const dir = path.dirname(reservedPath);
+    setTimeout(() => {
+      void fs.readdir(dir).then((entries) =>
+        Promise.all(
+          entries
+            .filter((name) => name.startsWith(prefix) && (name.endsWith(".part") || name.endsWith(".ytdl")))
+            .map((name) => fs.rm(path.join(dir, name), { force: true }).catch(() => undefined))
+        )
+      ).catch(() => undefined);
+    }, 350).unref();
+  }
+
+  private buildRefererCandidates(
+    request: DownloadStartRequest,
+    extraHeaders?: Record<string, string>
+  ): Array<string | undefined> {
+    const candidates: Array<string | undefined> = [];
+    const addCandidate = (value: unknown) => {
+      if (isHttpUrl(value) && !candidates.includes(value)) {
+        candidates.push(value);
+      }
+    };
+    addCandidate(extraHeaders?.Referer);
+    addCandidate(extraHeaders?.referer);
+    addCandidate(request.refererUrl);
+    addCandidate(request.pageUrl);
+    candidates.push(undefined);
+    return candidates;
+  }
+
+  private runFfmpegProcess(
+    ffmpegPath: string,
+    args: string[],
+    onSpawned: (child: ChildProcess) => void
+  ): Promise<{ code: number | null; stderr: string }> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let stderr = "";
+      const child = (this.options.spawnProcess ?? spawn)(ffmpegPath, args, {
+        shell: false,
+        windowsHide: true,
+      });
+      onSpawned(child);
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+        if (stderr.length > 8000) stderr = stderr.slice(-8000);
+      });
+      child.on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        resolve({ code: -1, stderr: err.message });
+      });
+      child.on("close", (code) => {
+        if (settled) return;
+        settled = true;
+        resolve({ code, stderr });
+      });
+    });
+  }
+
   async startDownload(
     request: DownloadStartRequest,
     targetSession: Session,
@@ -929,9 +1588,11 @@ export class DownloadManager {
     if (!isHttpUrl(request.pageUrl) || !isHttpUrl(request.probeUrl)) {
       return { ok: false, message: "无效的视频网址" };
     }
-    if (request.sourceType === "direct") {
-      if (!isHttpUrl(request.directUrl)) return { ok: false, message: "无效的直链地址" };
-      return this.startDirectDownload(request, targetSession);
+    const safeRefererUrl = isHttpUrl(request.refererUrl) ? request.refererUrl : request.pageUrl;
+    const normalizedRequest: DownloadStartRequest = { ...request, refererUrl: safeRefererUrl };
+    if (normalizedRequest.sourceType === "direct") {
+      if (!isHttpUrl(normalizedRequest.directUrl)) return { ok: false, message: "无效的直链地址" };
+      return this.startDirectDownload(normalizedRequest, targetSession);
     }
 
     const tools = await this.refreshToolStatus();
@@ -950,6 +1611,17 @@ export class DownloadManager {
     const uniqueStem = this.makeUniqueStemSync(outputDir, safeStem, expectedExt);
     const reservedPath = path.join(outputDir, `${uniqueStem}.${expectedExt}`);
     const outputTemplate = path.join(outputDir, `${uniqueStem}.%(ext)s`);
+
+    const cached = this.probedMediaCache.get(normalizedRequest.probeUrl);
+    const cacheValid = cached && Date.now() - cached.cachedAt < PROBED_MEDIA_CACHE_TTL_MS;
+    const concurrentSelection = cacheValid
+      ? selectConcurrentFormats(
+          cached.formats,
+          normalizedRequest.qualityId,
+          Boolean(tools.ffmpeg.path),
+          cached.httpHeaders
+        )
+      : null;
 
     const taskId = randomUUID();
     const task: DownloadTask = {
@@ -970,17 +1642,500 @@ export class DownloadManager {
     this.trimHistory();
     this.emitState();
 
-    void this.executeYtDlpTask(
-      taskId,
-      tools.ytDlp.path,
-      tools.ffmpeg.path,
-      request,
-      outputTemplate,
-      reservedPath,
-      targetSession,
-      proxySettings
-    );
+    if (concurrentSelection) {
+      void this.executeConcurrentRangeTask(
+        taskId,
+        concurrentSelection,
+        tools.ytDlp.path,
+        tools.ffmpeg.path,
+        normalizedRequest,
+        outputDir,
+        uniqueStem,
+        outputTemplate,
+        reservedPath,
+        targetSession,
+        proxySettings
+      );
+    } else {
+      void this.executeYtDlpTask(
+        taskId,
+        tools.ytDlp.path,
+        tools.ffmpeg.path,
+        normalizedRequest,
+        outputTemplate,
+        reservedPath,
+        targetSession,
+        proxySettings
+      );
+    }
     return { ok: true, taskId };
+  }
+
+  private async executeConcurrentRangeTask(
+    taskId: string,
+    initialSelection: ConcurrentFormatSelection,
+    ytDlpPath: string,
+    ffmpegPath: string | undefined,
+    request: DownloadStartRequest,
+    outputDir: string,
+    uniqueStem: string,
+    outputTemplate: string,
+    reservedPath: string,
+    targetSession: Session,
+    proxySettings: GlobalProxySettings
+  ): Promise<void> {
+    let selection = initialSelection;
+    const ext = path.extname(reservedPath).replace(/^\./, "").toLowerCase() || "mp4";
+    const tmpMuxPath = path.join(outputDir, `${uniqueStem}.mux.tmp.${ext}`);
+
+    const makePartPath = (role: "video" | "audio" | "single"): string => {
+      if (role === "single") {
+        return selection.isAudioOnly && ffmpegPath && ext === "mp3"
+          ? path.join(outputDir, `${uniqueStem}.audio.part`)
+          : `${reservedPath}.part`;
+      }
+      return path.join(outputDir, `${uniqueStem}.${role}.part`);
+    };
+
+    const transfers: {
+      video?: SingleStreamTransfer;
+      audio?: SingleStreamTransfer;
+      single?: SingleStreamTransfer;
+    } = {};
+    const transferList: SingleStreamTransfer[] = [];
+
+    let stopIntent: "none" | "pause" | "cancel" = "none";
+    let isRunning = false;
+    let runAbort: AbortController | null = null;
+    let runPromise: Promise<void> | null = null;
+    let ffmpegChild: ChildProcess | null = null;
+    let lastMeasureAt = Date.now();
+    let lastMeasureBytes = 0;
+    let currentSpeed = 0;
+    let urlRefreshAttempts = 0;
+
+    const getSummedProgress = (): { downloadedBytes: number; totalBytes: number | null } => {
+      let downloaded = 0;
+      let totalSum = 0;
+      let allTotalsKnown = true;
+      for (const item of transferList) {
+        const p = item.getProgress();
+        downloaded += p.downloadedBytes;
+        if (p.totalBytes !== null && p.totalBytes > 0) {
+          totalSum += p.totalBytes;
+        } else {
+          allTotalsKnown = false;
+        }
+      }
+      return {
+        downloadedBytes: downloaded,
+        totalBytes: allTotalsKnown && totalSum > 0 ? totalSum : null,
+      };
+    };
+
+    const emitProgress = () => {
+      if (stopIntent !== "none") return;
+      const { downloadedBytes, totalBytes } = getSummedProgress();
+      const now = Date.now();
+      const elapsed = (now - lastMeasureAt) / 1000;
+      if (elapsed >= 0.4) {
+        currentSpeed = Math.max(0, (downloadedBytes - lastMeasureBytes) / elapsed);
+        lastMeasureAt = now;
+        lastMeasureBytes = downloadedBytes;
+      }
+      const etaSeconds =
+        totalBytes && currentSpeed > 0 ? Math.max(0, (totalBytes - downloadedBytes) / currentSpeed) : null;
+      const progress = totalBytes && totalBytes > 0
+        ? Math.min(99.5, (downloadedBytes / totalBytes) * 100)
+        : null;
+      this.updateTask(taskId, {
+        status: "downloading",
+        downloadedBytes,
+        totalBytes,
+        progress,
+        speedText: currentSpeed > 0 ? formatSpeed(currentSpeed) : undefined,
+        etaText: etaSeconds !== null ? formatEta(etaSeconds) : undefined,
+      });
+    };
+
+    if (selection.mode === "dual") {
+      const videoTransfer = new SingleStreamTransfer(
+        targetSession,
+        this.options.userAgent,
+        {
+          url: selection.video.url,
+          partPath: makePartPath("video"),
+          refererCandidates: this.buildRefererCandidates(request, selection.video.headers),
+          extraHeaders: selection.video.headers,
+          concurrency: 4,
+        },
+        { onProgress: emitProgress }
+      );
+      const audioTransfer = new SingleStreamTransfer(
+        targetSession,
+        this.options.userAgent,
+        {
+          url: selection.audio.url,
+          partPath: makePartPath("audio"),
+          refererCandidates: this.buildRefererCandidates(request, selection.audio.headers),
+          extraHeaders: selection.audio.headers,
+          concurrency: 4,
+        },
+        { onProgress: emitProgress }
+      );
+      transfers.video = videoTransfer;
+      transfers.audio = audioTransfer;
+      transferList.push(videoTransfer, audioTransfer);
+    } else {
+      const singleTransfer = new SingleStreamTransfer(
+        targetSession,
+        this.options.userAgent,
+        {
+          url: selection.stream.url,
+          partPath: makePartPath("single"),
+          refererCandidates: this.buildRefererCandidates(request, selection.stream.headers),
+          extraHeaders: selection.stream.headers,
+          concurrency: 6,
+        },
+        { onProgress: emitProgress }
+      );
+      transfers.single = singleTransfer;
+      transferList.push(singleTransfer);
+    }
+
+    const tempPathsToDelete = (): string[] => [
+      ...transferList.map((item) => item.getPartPath()),
+      tmpMuxPath,
+    ];
+
+    const cleanupFilesAndCancel = async () => {
+      await Promise.all(tempPathsToDelete().map((p) => fs.rm(p, { force: true }).catch(() => undefined)));
+      this.activeControllers.delete(taskId);
+      this.reservedPaths.delete(reservedPath);
+      this.updateTask(
+        taskId,
+        {
+          status: "canceled",
+          speedText: undefined,
+          etaText: undefined,
+        },
+        true
+      );
+    };
+
+    const refreshStreamUrls = async (): Promise<boolean> => {
+      const probeResult = await this.runYtDlpProbe(
+        `refresh-${taskId}-${Date.now()}`,
+        ytDlpPath,
+        request.probeUrl,
+        request.refererUrl || request.pageUrl,
+        targetSession,
+        proxySettings,
+        Boolean(ffmpegPath)
+      );
+      if (!probeResult.ok) return false;
+      this.cacheProbedFormats(request.probeUrl, probeResult.formats, probeResult.httpHeaders);
+      const refreshed = selectConcurrentFormats(
+        probeResult.formats,
+        request.qualityId,
+        Boolean(ffmpegPath),
+        probeResult.httpHeaders
+      );
+      if (!refreshed || refreshed.mode !== selection.mode) return false;
+      selection = refreshed;
+      if (refreshed.mode === "dual") {
+        transfers.video?.updateEndpoint({
+          url: refreshed.video.url,
+          refererCandidates: this.buildRefererCandidates(request, refreshed.video.headers),
+          extraHeaders: refreshed.video.headers,
+        });
+        transfers.audio?.updateEndpoint({
+          url: refreshed.audio.url,
+          refererCandidates: this.buildRefererCandidates(request, refreshed.audio.headers),
+          extraHeaders: refreshed.audio.headers,
+        });
+      } else {
+        transfers.single?.updateEndpoint({
+          url: refreshed.stream.url,
+          refererCandidates: this.buildRefererCandidates(request, refreshed.stream.headers),
+          extraHeaders: refreshed.stream.headers,
+        });
+      }
+      return true;
+    };
+
+    const startRun = async (): Promise<void> => {
+      isRunning = true;
+      const controllerAbort = new AbortController();
+      runAbort = controllerAbort;
+      const initialSum = getSummedProgress();
+      lastMeasureAt = Date.now();
+      lastMeasureBytes = initialSum.downloadedBytes;
+      currentSpeed = 0;
+
+      try {
+        while (true) {
+          try {
+            await Promise.all(
+              transferList.map((item) =>
+                item.isCompleted() ? Promise.resolve() : item.run(controllerAbort.signal)
+              )
+            );
+            break;
+          } catch (error) {
+            if (stopIntent !== "none") break;
+            if (error instanceof RangeUrlExpiredError && urlRefreshAttempts < 1) {
+              urlRefreshAttempts += 1;
+              const refreshed = await refreshStreamUrls();
+              if (refreshed) continue;
+            }
+            throw error;
+          }
+        }
+
+        if (stopIntent === "pause") {
+          const { downloadedBytes, totalBytes } = getSummedProgress();
+          const progress = totalBytes && totalBytes > 0
+            ? Math.min(99.5, (downloadedBytes / totalBytes) * 100)
+            : this.tasks.get(taskId)?.progress ?? null;
+          this.updateTask(
+            taskId,
+            {
+              status: "paused",
+              downloadedBytes,
+              totalBytes,
+              progress,
+              speedText: undefined,
+              etaText: undefined,
+            },
+            true
+          );
+          return;
+        }
+
+        if (stopIntent === "cancel") {
+          await cleanupFilesAndCancel();
+          return;
+        }
+
+        // All streams finished cleanly -> merge or rename
+        if (selection.mode === "dual") {
+          if (!ffmpegPath) {
+            throw new Error("合并高画质音视频需要 ffmpeg，请先在下载面板点击安装组件");
+          }
+          this.updateTask(
+            taskId,
+            {
+              status: "merging",
+              progress: 100,
+              speedText: undefined,
+              etaText: undefined,
+            },
+            true
+          );
+          const videoPart = transfers.video!.getPartPath();
+          const audioPart = transfers.audio!.getPartPath();
+          let muxResult = await this.runFfmpegProcess(
+            ffmpegPath,
+            ["-y", "-i", videoPart, "-i", audioPart, "-c", "copy", "-movflags", "+faststart", tmpMuxPath],
+            (child) => {
+              ffmpegChild = child;
+            }
+          );
+          ffmpegChild = null;
+          if ((stopIntent as string) === "cancel") {
+            await cleanupFilesAndCancel();
+            return;
+          }
+          if (muxResult.code !== 0) {
+            muxResult = await this.runFfmpegProcess(
+              ffmpegPath,
+              [
+                "-y",
+                "-i",
+                videoPart,
+                "-i",
+                audioPart,
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
+                tmpMuxPath,
+              ],
+              (child) => {
+                ffmpegChild = child;
+              }
+            );
+            ffmpegChild = null;
+            if ((stopIntent as string) === "cancel") {
+              await cleanupFilesAndCancel();
+              return;
+            }
+            if (muxResult.code !== 0) {
+              throw new Error("ffmpeg 合并音视频失败");
+            }
+          }
+          await fs.rename(tmpMuxPath, reservedPath);
+          await Promise.all([
+            fs.rm(videoPart, { force: true }).catch(() => undefined),
+            fs.rm(audioPart, { force: true }).catch(() => undefined),
+          ]);
+        } else {
+          const singlePart = transfers.single!.getPartPath();
+          if (selection.isAudioOnly && ffmpegPath && ext === "mp3") {
+            this.updateTask(
+              taskId,
+              {
+                status: "merging",
+                progress: 100,
+                speedText: undefined,
+                etaText: undefined,
+              },
+              true
+            );
+            const convResult = await this.runFfmpegProcess(
+              ffmpegPath,
+              ["-y", "-i", singlePart, "-vn", "-c:a", "libmp3lame", "-q:a", "2", tmpMuxPath],
+              (child) => {
+                ffmpegChild = child;
+              }
+            );
+            ffmpegChild = null;
+            if ((stopIntent as string) === "cancel") {
+              await cleanupFilesAndCancel();
+              return;
+            }
+            if (convResult.code !== 0) {
+              throw new Error("ffmpeg 转换音频格式失败");
+            }
+            await fs.rename(tmpMuxPath, reservedPath);
+            await fs.rm(singlePart, { force: true }).catch(() => undefined);
+          } else {
+            await fs.rename(singlePart, reservedPath);
+          }
+        }
+
+        const finalStat = await fs.stat(reservedPath).catch(() => null);
+        const finalSize = finalStat?.size ?? getSummedProgress().downloadedBytes;
+        this.activeControllers.delete(taskId);
+        this.reservedPaths.delete(reservedPath);
+        this.updateTask(
+          taskId,
+          {
+            status: "completed",
+            progress: 100,
+            downloadedBytes: finalSize,
+            totalBytes: finalSize,
+            filePath: reservedPath,
+            fileName: path.basename(reservedPath),
+            speedText: undefined,
+            etaText: undefined,
+            error: undefined,
+          },
+          true
+        );
+      } catch (error) {
+        if (stopIntent === "pause") {
+          const { downloadedBytes, totalBytes } = getSummedProgress();
+          this.updateTask(
+            taskId,
+            {
+              status: "paused",
+              downloadedBytes,
+              totalBytes,
+              speedText: undefined,
+              etaText: undefined,
+            },
+            true
+          );
+          return;
+        }
+        if (stopIntent === "cancel") {
+          await cleanupFilesAndCancel();
+          return;
+        }
+
+        const { downloadedBytes } = getSummedProgress();
+        if (downloadedBytes === 0 && !(error instanceof RangeHttpError && error.statusCode === 404)) {
+          // Clean up empty temp files and transparently fall back to yt-dlp
+          await Promise.all(tempPathsToDelete().map((p) => fs.rm(p, { force: true }).catch(() => undefined)));
+          this.activeControllers.delete(taskId);
+          await this.executeYtDlpTask(
+            taskId,
+            ytDlpPath,
+            ffmpegPath,
+            request,
+            outputTemplate,
+            reservedPath,
+            targetSession,
+            proxySettings
+          );
+          return;
+        }
+
+        await Promise.all(tempPathsToDelete().map((p) => fs.rm(p, { force: true }).catch(() => undefined)));
+        this.activeControllers.delete(taskId);
+        this.reservedPaths.delete(reservedPath);
+        const message = error instanceof Error ? error.message : "下载失败";
+        this.updateTask(
+          taskId,
+          {
+            status: "failed",
+            error: message,
+            speedText: undefined,
+            etaText: undefined,
+          },
+          true
+        );
+      } finally {
+        isRunning = false;
+        runAbort = null;
+      }
+    };
+
+    this.activeControllers.set(taskId, {
+      pause: () => {
+        if (stopIntent !== "none" || ffmpegChild) return;
+        stopIntent = "pause";
+        runAbort?.abort();
+        this.updateTask(
+          taskId,
+          {
+            status: "paused",
+            speedText: undefined,
+            etaText: undefined,
+          },
+          true
+        );
+      },
+      resume: () => {
+        void (async () => {
+          if (runPromise) await runPromise.catch(() => undefined);
+          if (stopIntent === "cancel") return;
+          const current = this.tasks.get(taskId);
+          if (!current || current.status !== "paused") return;
+          stopIntent = "none";
+          this.updateTask(taskId, { status: "downloading", error: undefined }, true);
+          runPromise = startRun();
+        })();
+      },
+      cancel: () => {
+        stopIntent = "cancel";
+        runAbort?.abort();
+        if (ffmpegChild) killProcessTree(ffmpegChild);
+        if (!isRunning) {
+          void cleanupFilesAndCancel();
+        }
+      },
+    });
+
+    this.updateTask(taskId, { status: "downloading" }, true);
+    runPromise = startRun();
+    await runPromise;
   }
 
   private async executeYtDlpTask(
@@ -993,213 +2148,331 @@ export class DownloadManager {
     targetSession: Session,
     proxySettings: GlobalProxySettings
   ): Promise<void> {
-    const helpers = await this.prepareSessionHelpers(targetSession, request.probeUrl, proxySettings);
-    const task = this.tasks.get(taskId);
-    if (!task || task.status === "canceled") {
+    let stopIntent: "none" | "pause" | "cancel" = "none";
+    let resumePending = false;
+    let activeChild: ChildProcess | null = null;
+    let closePromise: Promise<void> | null = null;
+    let activeCookieFile: string | null = null;
+
+    const cleanupAndCancel = () => {
+      this.activeControllers.delete(taskId);
       this.reservedPaths.delete(reservedPath);
-      if (helpers.cookieFile) void fs.rm(helpers.cookieFile, { force: true }).catch(() => undefined);
-      return;
-    }
+      if (activeCookieFile) {
+        void fs.rm(activeCookieFile, { force: true }).catch(() => undefined);
+        activeCookieFile = null;
+      }
+      this.cleanupPartFilesLater(reservedPath);
+      this.updateTask(
+        taskId,
+        {
+          status: "canceled",
+          speedText: undefined,
+          etaText: undefined,
+        },
+        true
+      );
+    };
 
-    const args = [
-      "--newline",
-      "--no-colors",
-      "--encoding",
-      "utf-8",
-      "--no-playlist",
-      "--no-overwrites",
-      "--progress-template",
-      "download:__SSDL__|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress._percent_str)s",
-      "--progress-template",
-      "postprocess:__SSPP__|%(progress.status)s",
-      "--print",
-      "after_move:__SSFILE__|%(filepath)s",
-      "--user-agent",
-      this.options.userAgent,
-      "--referer",
-      request.pageUrl,
-    ];
-    if (ffmpegPath) {
-      args.push("--ffmpeg-location", ffmpegPath);
-    }
-    args.push("-f", request.selector);
-    if (request.isAudioOnly) {
-      if (ffmpegPath) args.push("-x", "--audio-format", "mp3");
-    } else if (ffmpegPath) {
-      args.push("--merge-output-format", "mp4");
-    }
-    if (helpers.proxyUrl) args.push("--proxy", helpers.proxyUrl);
-    if (helpers.cookieFile) args.push("--cookies", helpers.cookieFile);
-    args.push("-o", outputTemplate, "--", request.probeUrl);
+    const launchYtDlp = async (): Promise<void> => {
+      const helpers = await this.prepareSessionHelpers(targetSession, request.probeUrl, proxySettings);
+      activeCookieFile = helpers.cookieFile;
+      const task = this.tasks.get(taskId);
+      if (!task || task.status === "canceled" || stopIntent === "cancel") {
+        cleanupAndCancel();
+        return;
+      }
 
-    const child = (this.options.spawnProcess ?? spawn)(ytDlpPath, args, {
-      shell: false,
-      windowsHide: true,
-      env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" },
-    });
+      const args = [
+        "--newline",
+        "--no-colors",
+        "--encoding",
+        "utf-8",
+        "--no-playlist",
+        "--no-overwrites",
+        "--continue",
+        "--concurrent-fragments",
+        "4",
+        "--progress",
+        "--no-quiet",
+        "--progress-template",
+        "download:__SSDL__|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress._percent_str)s",
+        "--progress-template",
+        "postprocess:__SSPP__|%(progress.status)s",
+        "--print",
+        "after_move:__SSFILE__|%(filepath)s",
+        "--user-agent",
+        this.options.userAgent,
+        "--referer",
+        request.refererUrl || request.pageUrl,
+      ];
+      if (ffmpegPath) {
+        args.push("--ffmpeg-location", ffmpegPath);
+      }
+      args.push("-f", request.selector);
+      if (request.isAudioOnly) {
+        if (ffmpegPath) args.push("-x", "--audio-format", "mp3");
+      } else if (ffmpegPath) {
+        args.push("--merge-output-format", "mp4");
+      }
+      if (helpers.proxyUrl) args.push("--proxy", helpers.proxyUrl);
+      if (helpers.cookieFile) args.push("--cookies", helpers.cookieFile);
+      args.push("-o", outputTemplate, "--", request.probeUrl);
 
-    let canceled = false;
-    let finalFilePath: string | undefined;
-    let stdoutBuffer = "";
-    const stderrLines: string[] = [];
+      const child = (this.options.spawnProcess ?? spawn)(ytDlpPath, args, {
+        shell: false,
+        windowsHide: true,
+        env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" },
+      });
+      activeChild = child;
+      let resolveClose!: () => void;
+      closePromise = new Promise<void>((resolve) => {
+        resolveClose = resolve;
+      });
 
-    this.activeControllers.set(taskId, {
-      cancel: () => {
-        canceled = true;
-        killProcessTree(child);
-      },
-    });
-    this.updateTask(taskId, { status: "downloading" }, true);
+      let finalFilePath: string | undefined;
+      let stdoutBuffer = "";
+      let stderrBuffer = "";
+      let finishedStreams = 0;
+      const expectsTwoStreams = !request.isAudioOnly && Boolean(ffmpegPath) && request.selector.includes("+");
+      const stderrLines: string[] = [];
 
-    const handleStdoutLine = (line: string) => {
-      const trimmed = line.trim();
-      if (!trimmed) return;
-      if (trimmed.startsWith("__SSFILE__|")) {
-        const filePath = trimmed.slice("__SSFILE__|".length).trim();
-        if (filePath) {
-          finalFilePath = filePath;
-          this.updateTask(taskId, {
-            filePath,
-            fileName: path.basename(filePath),
-          });
+      this.updateTask(taskId, { status: "downloading", error: undefined }, true);
+
+      const mapProgress = (rawProgress: number | null, finished: boolean): number | null => {
+        if (!expectsTwoStreams) return finished ? 100 : rawProgress;
+        if (finished) return finishedStreams === 0 ? 90 : 99;
+        if (rawProgress === null) return null;
+        return finishedStreams === 0
+          ? Math.min(90, rawProgress * 0.9)
+          : Math.min(99, 90 + rawProgress * 0.09);
+      };
+
+      const handleOutputLine = (line: string): boolean => {
+        if (stopIntent !== "none") return true;
+        const trimmed = line.trim();
+        if (!trimmed) return true;
+        if (trimmed.startsWith("__SSFILE__|")) {
+          const filePath = trimmed.slice("__SSFILE__|".length).trim();
+          if (filePath) {
+            finalFilePath = filePath;
+            this.updateTask(taskId, {
+              filePath,
+              fileName: path.basename(filePath),
+            });
+          }
+          return true;
         }
-        return;
-      }
-      const parsed = parseYtDlpProgressLine(trimmed);
-      if (!parsed) return;
-      if (parsed.kind === "postprocess") {
+        const parsed = parseYtDlpProgressLine(trimmed);
+        if (!parsed) return false;
+        if (parsed.kind === "postprocess") {
+          this.updateTask(
+            taskId,
+            {
+              status: "merging",
+              progress: 100,
+              speedText: undefined,
+              etaText: undefined,
+            },
+            true
+          );
+          return true;
+        }
+        if (parsed.status === "finished") {
+          const mapped = mapProgress(100, true);
+          finishedStreams += 1;
+          this.updateTask(
+            taskId,
+            {
+              downloadedBytes: parsed.totalBytes ?? parsed.downloadedBytes,
+              totalBytes: parsed.totalBytes ?? parsed.downloadedBytes,
+              progress: mapped,
+              speedText: undefined,
+              etaText: undefined,
+            },
+            true
+          );
+          return true;
+        }
+        this.updateTask(taskId, {
+          status: "downloading",
+          downloadedBytes: parsed.downloadedBytes,
+          totalBytes: parsed.totalBytes,
+          progress: mapProgress(parsed.progress, false),
+          speedText: parsed.speedBytesPerSec ? formatSpeed(parsed.speedBytesPerSec) : undefined,
+          etaText: parsed.etaSeconds !== null ? formatEta(parsed.etaSeconds) : undefined,
+        });
+        return true;
+      };
+
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdoutBuffer += chunk;
+        const lines = stdoutBuffer.split(/\r?\n/);
+        stdoutBuffer = lines.pop() ?? "";
+        for (const line of lines) handleOutputLine(line);
+      });
+      child.stderr.on("data", (chunk: string) => {
+        stderrBuffer += chunk;
+        const lines = stderrBuffer.split(/\r?\n/);
+        stderrBuffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          if (handleOutputLine(trimmed)) continue;
+          stderrLines.push(trimmed);
+          if (stderrLines.length > 30) stderrLines.shift();
+        }
+      });
+
+      child.on("error", (error) => {
+        activeChild = null;
+        if (activeCookieFile) {
+          void fs.rm(activeCookieFile, { force: true }).catch(() => undefined);
+          activeCookieFile = null;
+        }
+        resolveClose();
+        if (stopIntent === "pause") {
+          if (!resumePending) {
+            this.updateTask(taskId, { status: "paused", speedText: undefined, etaText: undefined }, true);
+          }
+          return;
+        }
+        this.activeControllers.delete(taskId);
+        this.reservedPaths.delete(reservedPath);
         this.updateTask(
           taskId,
           {
-            status: "merging",
-            progress: 100,
+            status: stopIntent === "cancel" ? "canceled" : "failed",
+            error: stopIntent === "cancel" ? undefined : `启动 yt-dlp 失败：${error.message}`,
             speedText: undefined,
             etaText: undefined,
           },
           true
         );
-        return;
-      }
-      if (parsed.status === "finished") {
+      });
+
+      child.on("close", (code) => {
+        activeChild = null;
+        if (stdoutBuffer) handleOutputLine(stdoutBuffer);
+        if (stderrBuffer) {
+          const trimmed = stderrBuffer.trim();
+          if (trimmed && !handleOutputLine(trimmed)) {
+            stderrLines.push(trimmed);
+            if (stderrLines.length > 30) stderrLines.shift();
+          }
+        }
+        if (activeCookieFile) {
+          void fs.rm(activeCookieFile, { force: true }).catch(() => undefined);
+          activeCookieFile = null;
+        }
+        resolveClose();
+
+        if (stopIntent === "pause") {
+          if (!resumePending) {
+            this.updateTask(
+              taskId,
+              {
+                status: "paused",
+                speedText: undefined,
+                etaText: undefined,
+              },
+              true
+            );
+          }
+          return;
+        }
+
+        if (stopIntent === "cancel") {
+          cleanupAndCancel();
+          return;
+        }
+
+        this.activeControllers.delete(taskId);
+        this.reservedPaths.delete(reservedPath);
+
+        if (code === 0) {
+          const currentTask = this.tasks.get(taskId);
+          const resolvedPath = finalFilePath && existsSync(finalFilePath)
+            ? finalFilePath
+            : existsSync(reservedPath)
+              ? reservedPath
+              : finalFilePath;
+          this.updateTask(
+            taskId,
+            {
+              status: "completed",
+              progress: 100,
+              filePath: resolvedPath,
+              fileName: resolvedPath ? path.basename(resolvedPath) : currentTask?.fileName ?? path.basename(reservedPath),
+              speedText: undefined,
+              etaText: undefined,
+              error: undefined,
+            },
+            true
+          );
+          return;
+        }
+
         this.updateTask(
           taskId,
           {
-            downloadedBytes: parsed.totalBytes ?? parsed.downloadedBytes,
-            totalBytes: parsed.totalBytes ?? parsed.downloadedBytes,
-            progress: 100,
+            status: "failed",
+            error: translateYtDlpError(stderrLines.join("\n"), Boolean(ffmpegPath)),
             speedText: undefined,
             etaText: undefined,
           },
           true
         );
-        return;
-      }
-      this.updateTask(taskId, {
-        status: "downloading",
-        downloadedBytes: parsed.downloadedBytes,
-        totalBytes: parsed.totalBytes,
-        progress: parsed.progress,
-        speedText: parsed.speedBytesPerSec ? formatSpeed(parsed.speedBytesPerSec) : undefined,
-        etaText: parsed.etaSeconds !== null ? formatEta(parsed.etaSeconds) : undefined,
       });
     };
 
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      stdoutBuffer += chunk;
-      const lines = stdoutBuffer.split(/\r?\n/);
-      stdoutBuffer = lines.pop() ?? "";
-      for (const line of lines) handleStdoutLine(line);
-    });
-    child.stderr.on("data", (chunk: string) => {
-      for (const line of chunk.split(/\r?\n/)) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        stderrLines.push(trimmed);
-        if (stderrLines.length > 30) stderrLines.shift();
-      }
-    });
-
-    child.on("error", (error) => {
-      this.activeControllers.delete(taskId);
-      this.reservedPaths.delete(reservedPath);
-      if (helpers.cookieFile) void fs.rm(helpers.cookieFile, { force: true }).catch(() => undefined);
-      this.updateTask(
-        taskId,
-        {
-          status: canceled ? "canceled" : "failed",
-          error: canceled ? undefined : `启动 yt-dlp 失败：${error.message}`,
-          speedText: undefined,
-          etaText: undefined,
-        },
-        true
-      );
-    });
-
-    child.on("close", (code) => {
-      if (stdoutBuffer) handleStdoutLine(stdoutBuffer);
-      this.activeControllers.delete(taskId);
-      this.reservedPaths.delete(reservedPath);
-      if (helpers.cookieFile) void fs.rm(helpers.cookieFile, { force: true }).catch(() => undefined);
-
-      if (canceled) {
-        const prefix = `${path.parse(reservedPath).name}.`;
-        const dir = path.dirname(reservedPath);
-        setTimeout(() => {
-          void fs.readdir(dir).then((entries) =>
-            Promise.all(
-              entries
-                .filter((name) => name.startsWith(prefix) && (name.endsWith(".part") || name.endsWith(".ytdl")))
-                .map((name) => fs.rm(path.join(dir, name), { force: true }).catch(() => undefined))
-            )
-          ).catch(() => undefined);
-        }, 350).unref();
+    this.activeControllers.set(taskId, {
+      pause: () => {
+        if (stopIntent !== "none") return;
+        const current = this.tasks.get(taskId);
+        if (!current || current.status === "merging") return;
+        stopIntent = "pause";
+        resumePending = false;
+        if (activeChild) killProcessTree(activeChild);
         this.updateTask(
           taskId,
           {
-            status: "canceled",
+            status: "paused",
             speedText: undefined,
             etaText: undefined,
           },
           true
         );
-        return;
-      }
-
-      if (code === 0) {
-        const resolvedPath = finalFilePath && existsSync(finalFilePath)
-          ? finalFilePath
-          : existsSync(reservedPath)
-            ? reservedPath
-            : finalFilePath;
-        this.updateTask(
-          taskId,
-          {
-            status: "completed",
-            progress: 100,
-            filePath: resolvedPath,
-            fileName: resolvedPath ? path.basename(resolvedPath) : task.fileName,
-            speedText: undefined,
-            etaText: undefined,
-            error: undefined,
-          },
-          true
-        );
-        return;
-      }
-
-      this.updateTask(
-        taskId,
-        {
-          status: "failed",
-          error: translateYtDlpError(stderrLines.join("\n"), Boolean(ffmpegPath)),
-          speedText: undefined,
-          etaText: undefined,
-        },
-        true
-      );
+      },
+      resume: () => {
+        const current = this.tasks.get(taskId);
+        if (!current || current.status !== "paused" || resumePending) return;
+        resumePending = true;
+        this.updateTask(taskId, { status: "queued", error: undefined }, true);
+        void (async () => {
+          if (closePromise) await closePromise;
+          resumePending = false;
+          if (stopIntent === "cancel") {
+            cleanupAndCancel();
+            return;
+          }
+          stopIntent = "none";
+          await launchYtDlp();
+        })();
+      },
+      cancel: () => {
+        stopIntent = "cancel";
+        resumePending = false;
+        if (activeChild) {
+          killProcessTree(activeChild);
+        } else {
+          cleanupAndCancel();
+        }
+      },
     });
+
+    await launchYtDlp();
   }
 
   private async startDirectDownload(
@@ -1212,10 +2485,9 @@ export class DownloadManager {
     const ext = /^[a-z0-9]{1,8}$/i.test(request.ext ?? "") ? request.ext!.toLowerCase() : inferExtensionFromUrl(directUrl, "mp4");
     const uniqueStem = this.makeUniqueStemSync(outputDir, safeStem, ext);
     let reservedDest = path.join(outputDir, `${uniqueStem}.${ext}`);
-    const destPath = reservedDest;
+    let partPath = `${reservedDest}.part`;
 
     const taskId = randomUUID();
-    const abort = new AbortController();
     const task: DownloadTask = {
       id: taskId,
       paneId: request.paneId,
@@ -1231,94 +2503,127 @@ export class DownloadManager {
       createdAt: Date.now(),
     };
     this.tasks.set(taskId, task);
-    this.activeControllers.set(taskId, {
-      cancel: () => abort.abort(),
-    });
     this.trimHistory();
     this.emitState();
 
-    void (async () => {
-      let partPath = `${destPath}.part`;
-      try {
-        const response = await targetSession.fetch(directUrl, {
-          headers: {
-            Referer: request.pageUrl,
-            "User-Agent": this.options.userAgent,
-          },
-          signal: abort.signal,
-        });
-        if (!response.ok || !response.body) {
-          throw new Error(`服务器返回 HTTP ${response.status}`);
-        }
-        const contentType = response.headers.get("content-type");
-        if (contentType && /text\/html|application\/vnd\.apple\.mpegurl|application\/x-mpegurl/i.test(contentType)) {
-          throw new Error("当前地址是网页或流媒体列表而非视频文件，请安装 yt-dlp 后下载");
-        }
-        const headerExt = inferExtensionFromContentType(contentType);
-        if (headerExt && headerExt !== ext) {
-          const updatedStem = this.makeUniqueStemSync(outputDir, safeStem, headerExt);
-          const nextDest = path.join(outputDir, `${updatedStem}.${headerExt}`);
-          this.reservedPaths.delete(reservedDest);
-          reservedDest = nextDest;
-          partPath = `${nextDest}.part`;
-        }
-        const totalHeader = Number(response.headers.get("content-length") ?? "0");
-        const totalBytes = Number.isFinite(totalHeader) && totalHeader > 0 ? totalHeader : null;
-        this.updateTask(taskId, { totalBytes, fileName: path.basename(reservedDest) }, true);
+    let stopIntent: "none" | "pause" | "cancel" = "none";
+    let isRunning = false;
+    let runAbort: AbortController | null = null;
+    let runPromise: Promise<void> | null = null;
+    let lastMeasureAt = Date.now();
+    let lastMeasureBytes = 0;
+    let currentSpeed = 0;
 
-        let downloaded = 0;
-        let lastMeasureAt = Date.now();
-        let lastMeasureBytes = 0;
-        let currentSpeed = 0;
-        const reader = response.body.getReader();
-        const writer = createWriteStream(partPath);
-        try {
-          while (true) {
-            if (abort.signal.aborted) throw new Error("Aborted");
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (!value) continue;
-            downloaded += value.byteLength;
-            if (!writer.write(value)) {
-              await new Promise<void>((resolve, reject) => {
-                writer.once("drain", resolve);
-                writer.once("error", reject);
-              });
-            }
-            const now = Date.now();
-            const elapsed = (now - lastMeasureAt) / 1000;
-            if (elapsed >= 0.4) {
-              currentSpeed = (downloaded - lastMeasureBytes) / elapsed;
-              lastMeasureAt = now;
-              lastMeasureBytes = downloaded;
-            }
-            const etaSeconds =
-              totalBytes && currentSpeed > 0 ? Math.max(0, (totalBytes - downloaded) / currentSpeed) : null;
-            this.updateTask(taskId, {
-              downloadedBytes: downloaded,
-              totalBytes,
-              progress: totalBytes ? Math.min(100, (downloaded / totalBytes) * 100) : null,
-              speedText: currentSpeed > 0 ? formatSpeed(currentSpeed) : undefined,
-              etaText: etaSeconds !== null ? formatEta(etaSeconds) : undefined,
-            });
+    const refererCandidates = this.buildRefererCandidates(request);
+    let transfer: SingleStreamTransfer;
+
+    const emitProgress = () => {
+      if (stopIntent !== "none") return;
+      const { downloadedBytes, totalBytes } = transfer.getProgress();
+      const now = Date.now();
+      const elapsed = (now - lastMeasureAt) / 1000;
+      if (elapsed >= 0.4) {
+        currentSpeed = Math.max(0, (downloadedBytes - lastMeasureBytes) / elapsed);
+        lastMeasureAt = now;
+        lastMeasureBytes = downloadedBytes;
+      }
+      const etaSeconds =
+        totalBytes && currentSpeed > 0 ? Math.max(0, (totalBytes - downloadedBytes) / currentSpeed) : null;
+      this.updateTask(taskId, {
+        status: "downloading",
+        downloadedBytes,
+        totalBytes,
+        progress: totalBytes ? Math.min(100, (downloadedBytes / totalBytes) * 100) : null,
+        speedText: currentSpeed > 0 ? formatSpeed(currentSpeed) : undefined,
+        etaText: etaSeconds !== null ? formatEta(etaSeconds) : undefined,
+      });
+    };
+
+    transfer = new SingleStreamTransfer(
+      targetSession,
+      this.options.userAgent,
+      {
+        url: directUrl,
+        partPath,
+        refererCandidates,
+        concurrency: 6,
+      },
+      {
+        onProgress: emitProgress,
+        onInitialHeaders: ({ contentType, totalBytes }) => {
+          const headerExt = inferExtensionFromContentType(contentType);
+          if (headerExt && headerExt !== ext) {
+            const updatedStem = this.makeUniqueStemSync(outputDir, safeStem, headerExt);
+            const nextDest = path.join(outputDir, `${updatedStem}.${headerExt}`);
+            this.reservedPaths.delete(reservedDest);
+            reservedDest = nextDest;
+            partPath = `${nextDest}.part`;
           }
-          await new Promise<void>((resolve, reject) => {
-            writer.end(() => resolve());
-            writer.once("error", reject);
-          });
-        } catch (err) {
-          writer.destroy();
-          throw err;
+          this.updateTask(taskId, { totalBytes, fileName: path.basename(reservedDest) }, true);
+          return { partPath };
+        },
+      }
+    );
+
+    const cleanupAndCancel = async () => {
+      await fs.rm(partPath, { force: true }).catch(() => undefined);
+      this.activeControllers.delete(taskId);
+      this.reservedPaths.delete(reservedDest);
+      this.updateTask(
+        taskId,
+        {
+          status: "canceled",
+          speedText: undefined,
+          etaText: undefined,
+        },
+        true
+      );
+    };
+
+    const startRun = async (): Promise<void> => {
+      isRunning = true;
+      const abort = new AbortController();
+      runAbort = abort;
+      const initial = transfer.getProgress();
+      lastMeasureAt = Date.now();
+      lastMeasureBytes = initial.downloadedBytes;
+      currentSpeed = 0;
+
+      try {
+        await transfer.run(abort.signal);
+
+        if (stopIntent === "pause") {
+          const { downloadedBytes, totalBytes } = transfer.getProgress();
+          this.updateTask(
+            taskId,
+            {
+              status: "paused",
+              downloadedBytes,
+              totalBytes,
+              progress: totalBytes ? Math.min(100, (downloadedBytes / totalBytes) * 100) : this.tasks.get(taskId)?.progress ?? null,
+              speedText: undefined,
+              etaText: undefined,
+            },
+            true
+          );
+          return;
         }
+        if (stopIntent === "cancel") {
+          await cleanupAndCancel();
+          return;
+        }
+
         await fs.rename(partPath, reservedDest);
+        const { downloadedBytes, totalBytes } = transfer.getProgress();
+        this.activeControllers.delete(taskId);
         this.reservedPaths.delete(reservedDest);
         this.updateTask(
           taskId,
           {
             status: "completed",
             progress: 100,
-            downloadedBytes: downloaded,
-            totalBytes: totalBytes ?? downloaded,
+            downloadedBytes,
+            totalBytes: totalBytes ?? downloadedBytes,
             filePath: reservedDest,
             fileName: path.basename(reservedDest),
             speedText: undefined,
@@ -1327,24 +2632,85 @@ export class DownloadManager {
           true
         );
       } catch (error) {
+        if (stopIntent === "pause") {
+          const { downloadedBytes, totalBytes } = transfer.getProgress();
+          this.updateTask(
+            taskId,
+            {
+              status: "paused",
+              downloadedBytes,
+              totalBytes,
+              speedText: undefined,
+              etaText: undefined,
+            },
+            true
+          );
+          return;
+        }
+        if (stopIntent === "cancel") {
+          await cleanupAndCancel();
+          return;
+        }
+
         await fs.rm(partPath, { force: true }).catch(() => undefined);
+        this.activeControllers.delete(taskId);
         this.reservedPaths.delete(reservedDest);
-        const canceled = abort.signal.aborted;
+        const rawMessage = error instanceof Error ? error.message : "下载失败";
+        const message = /ERR_BLOCKED_BY_CLIENT/i.test(rawMessage)
+          ? "直链请求被安全策略拦截（ERR_BLOCKED_BY_CLIENT），可尝试重新解析该页面"
+          : rawMessage;
         this.updateTask(
           taskId,
           {
-            status: canceled ? "canceled" : "failed",
-            error: canceled ? undefined : error instanceof Error ? error.message : "下载失败",
+            status: "failed",
+            error: message,
             speedText: undefined,
             etaText: undefined,
           },
           true
         );
       } finally {
-        this.activeControllers.delete(taskId);
+        isRunning = false;
+        runAbort = null;
       }
-    })();
+    };
 
+    this.activeControllers.set(taskId, {
+      pause: () => {
+        if (stopIntent !== "none") return;
+        stopIntent = "pause";
+        runAbort?.abort();
+        this.updateTask(
+          taskId,
+          {
+            status: "paused",
+            speedText: undefined,
+            etaText: undefined,
+          },
+          true
+        );
+      },
+      resume: () => {
+        void (async () => {
+          if (runPromise) await runPromise.catch(() => undefined);
+          if (stopIntent === "cancel") return;
+          const current = this.tasks.get(taskId);
+          if (!current || current.status !== "paused") return;
+          stopIntent = "none";
+          this.updateTask(taskId, { status: "downloading", error: undefined }, true);
+          runPromise = startRun();
+        })();
+      },
+      cancel: () => {
+        stopIntent = "cancel";
+        runAbort?.abort();
+        if (!isRunning) {
+          void cleanupAndCancel();
+        }
+      },
+    });
+
+    runPromise = startRun();
     return { ok: true, taskId };
   }
 
@@ -1379,6 +2745,22 @@ export class DownloadManager {
         createdAt: Date.now(),
       });
       this.activeControllers.set(taskId, {
+        pause: () => {
+          try {
+            item.pause();
+            this.updateTask(taskId, { status: "paused", speedText: undefined, etaText: undefined }, true);
+          } catch {
+          }
+        },
+        resume: () => {
+          try {
+            if (typeof item.canResume !== "function" || item.canResume()) {
+              item.resume();
+              this.updateTask(taskId, { status: "downloading" }, true);
+            }
+          } catch {
+          }
+        },
         cancel: () => {
           try {
             item.cancel();
@@ -1394,6 +2776,7 @@ export class DownloadManager {
       let speed = 0;
 
       item.on("updated", (_updateEvent, state) => {
+        const paused = typeof (item as { isPaused?: () => boolean }).isPaused === "function" && item.isPaused();
         const received = item.getReceivedBytes();
         const total = item.getTotalBytes() > 0 ? item.getTotalBytes() : null;
         const now = Date.now();
@@ -1405,12 +2788,12 @@ export class DownloadManager {
         }
         const etaSeconds = total && speed > 0 ? Math.max(0, (total - received) / speed) : null;
         this.updateTask(taskId, {
-          status: state === "interrupted" ? "failed" : "downloading",
+          status: paused ? "paused" : state === "interrupted" ? "failed" : "downloading",
           downloadedBytes: received,
           totalBytes: total,
           progress: total ? Math.min(100, (received / total) * 100) : null,
-          speedText: speed > 0 ? formatSpeed(speed) : undefined,
-          etaText: etaSeconds !== null ? formatEta(etaSeconds) : undefined,
+          speedText: !paused && speed > 0 ? formatSpeed(speed) : undefined,
+          etaText: !paused && etaSeconds !== null ? formatEta(etaSeconds) : undefined,
         });
       });
 
@@ -1458,6 +2841,24 @@ export class DownloadManager {
     });
   }
 
+  pauseTask(taskId: string): boolean {
+    const task = this.tasks.get(taskId);
+    const controller = this.activeControllers.get(taskId);
+    if (!task || !controller?.pause) return false;
+    if (task.status !== "downloading" && task.status !== "queued") return false;
+    controller.pause();
+    return true;
+  }
+
+  resumeTask(taskId: string): boolean {
+    const task = this.tasks.get(taskId);
+    const controller = this.activeControllers.get(taskId);
+    if (!task || !controller?.resume) return false;
+    if (task.status !== "paused") return false;
+    controller.resume();
+    return true;
+  }
+
   cancelTask(taskId: string): boolean {
     const controller = this.activeControllers.get(taskId);
     if (controller) {
@@ -1465,7 +2866,7 @@ export class DownloadManager {
       return true;
     }
     const task = this.tasks.get(taskId);
-    if (task && (task.status === "queued" || task.status === "downloading" || task.status === "merging")) {
+    if (task && (task.status === "queued" || task.status === "downloading" || task.status === "paused" || task.status === "merging")) {
       this.updateTask(taskId, { status: "canceled", speedText: undefined, etaText: undefined }, true);
       return true;
     }
@@ -1475,7 +2876,7 @@ export class DownloadManager {
   removeTask(taskId: string): boolean {
     const task = this.tasks.get(taskId);
     if (!task) return false;
-    if (task.status === "queued" || task.status === "downloading" || task.status === "merging") {
+    if (task.status === "queued" || task.status === "downloading" || task.status === "paused" || task.status === "merging") {
       this.cancelTask(taskId);
     }
     this.tasks.delete(taskId);

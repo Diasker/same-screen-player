@@ -102,6 +102,10 @@ contextBridge.exposeInMainWorld("desktop", {
     ipcRenderer.invoke("downloads:cancelProbe", probeId),
   startDownload: (request: DownloadStartRequest): Promise<{ ok: true; taskId: string } | { ok: false; message: string }> =>
     ipcRenderer.invoke("downloads:start", request),
+  pauseDownloadTask: (taskId: string): Promise<boolean> =>
+    ipcRenderer.invoke("downloads:pauseTask", taskId),
+  resumeDownloadTask: (taskId: string): Promise<boolean> =>
+    ipcRenderer.invoke("downloads:resumeTask", taskId),
   cancelDownloadTask: (taskId: string): Promise<boolean> =>
     ipcRenderer.invoke("downloads:cancelTask", taskId),
   removeDownloadTask: (taskId: string): Promise<boolean> =>

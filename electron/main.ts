@@ -331,6 +331,7 @@ function recordFingerprintDiagnostic(paneId: string, data: unknown): void {
 }
 
 function handlePaneNavigation(paneId: string, contents: Electron.WebContents, url: string): void {
+  downloadManager?.handlePaneNavigation(contents.id, url);
   if (isFileUrl(url)) {
     try { contents.send("challenge-navigation", { status: "none" }); } catch { }
     return;
@@ -378,6 +379,7 @@ function unbindGuest(webContentsId: number): void {
   binding.contents.removeListener("did-frame-finish-load", binding.onFrameFinish);
   binding.contents.removeListener("destroyed", binding.onDestroyed);
   adblockService?.detach(webContentsId);
+  downloadManager?.clearObservedMedia(webContentsId);
   guestBindings.delete(webContentsId);
   paneWebContents.delete(webContentsId);
   panePartitions.delete(binding.paneId);
@@ -923,6 +925,14 @@ function registerIpc(): void {
     const effectiveProxy = resolveProxySettings(globalProxySettings, paneProxySettings.get(input.paneId) ?? defaultPaneProxySettings());
     return downloadManager.startDownload(input as DownloadStartRequest, targetSession, effectiveProxy);
   });
+  ipcMain.handle("downloads:pauseTask", (event, taskId: unknown) => {
+    if (event.sender !== mainWindow?.webContents || typeof taskId !== "string" || !downloadManager) return false;
+    return downloadManager.pauseTask(taskId);
+  });
+  ipcMain.handle("downloads:resumeTask", (event, taskId: unknown) => {
+    if (event.sender !== mainWindow?.webContents || typeof taskId !== "string" || !downloadManager) return false;
+    return downloadManager.resumeTask(taskId);
+  });
   ipcMain.handle("downloads:cancelTask", (event, taskId: unknown) => {
     if (event.sender !== mainWindow?.webContents || typeof taskId !== "string" || !downloadManager) return false;
     return downloadManager.cancelTask(taskId);
@@ -992,6 +1002,22 @@ function installSessionDiagnostics(targetSession: Electron.Session): void {
   installedSessionDiagnostics.add(targetSession);
   targetSession.webRequest.onCompleted({ urls: ["<all_urls>"] }, (details) => {
     const resourceType = String(details.resourceType);
+    let frameUrl: string | undefined;
+    try {
+      if (details.frame && !details.frame.isDestroyed()) {
+        frameUrl = details.frame.url;
+      }
+    } catch {
+    }
+    downloadManager?.observeCompletedRequest({
+      url: details.url,
+      webContentsId: details.webContentsId,
+      resourceType,
+      statusCode: details.statusCode,
+      referrer: details.referrer,
+      frameUrl,
+      responseHeaders: details.responseHeaders,
+    });
     const paneId = typeof details.webContentsId === "number" ? paneWebContents.get(details.webContentsId) : undefined;
     const challengeResource = isCloudflareChallengeRequest(details.url, details.resourceType);
     const trackedChallengePage = Boolean(paneId && challengeModePanes.has(paneId) && resourceType === "mainFrame");
@@ -1131,6 +1157,13 @@ app.whenReady().then(async () => {
     userAgent: chromeUserAgent(),
     fetchWithProxy: (url, options) => session.fromPartition("persist:shared").fetch(url, options),
     getPaneIdByWebContentsId: (webContentsId) => paneWebContents.get(webContentsId),
+    isAdUrl: (url, sourceUrl, resourceType) => {
+      const engine = subscriptions?.engine;
+      if (!engine) return false;
+      const type = resourceType === "xhr" || resourceType === "media" || resourceType === "subFrame" ? resourceType : "other";
+      const match = engine.match(url, sourceUrl || url, type);
+      return Boolean(match.match && !match.exception);
+    },
     onStateChanged: (snapshot) => sendWindowMessage("downloads:state", snapshot),
   });
   await downloadManager.initialize();

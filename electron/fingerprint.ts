@@ -190,6 +190,20 @@ export function chromeClientHintHeaders(version: string = chromeFullVersion()): 
 
 const fingerprintInstalledSessions = new WeakSet<Session>();
 let fingerprintVersion = chromeFullVersion();
+const sessionHeaderOverrides = new Map<string, Record<string, string>>();
+export const INTERNAL_REQUEST_HEADER_TOKEN = "X-SameScreen-Header-Token";
+
+export function isFingerprintSessionInstalled(targetSession: Session): boolean {
+  return fingerprintInstalledSessions.has(targetSession);
+}
+
+export function registerSessionHeaderOverride(token: string, headers: Record<string, string>): void {
+  sessionHeaderOverrides.set(token, { ...headers });
+}
+
+export function unregisterSessionHeaderOverride(token: string): void {
+  sessionHeaderOverrides.delete(token);
+}
 
 export function setFingerprintVersion(version: string): void {
   if (typeof version === "string" && version.length > 0) fingerprintVersion = version;
@@ -205,10 +219,26 @@ export function applyChromeClientHints(requestHeaders: Record<string, string>): 
 
 export function applyChromeRequestHeaders(requestHeaders: Record<string, string>): Record<string, string> {
   const next: Record<string, string> = {};
+  let overrideToken: string | undefined;
   for (const [key, value] of Object.entries(requestHeaders)) {
     const lower = key.toLowerCase();
+    if (lower === "x-samescreen-header-token") {
+      overrideToken = value;
+      continue;
+    }
     if (lower.startsWith("sec-ch-ua") || lower === "user-agent") continue;
     next[key] = value;
+  }
+  const overrides = overrideToken ? sessionHeaderOverrides.get(overrideToken) : undefined;
+  if (overrides) {
+    for (const [key, value] of Object.entries(overrides)) {
+      const lower = key.toLowerCase();
+      if (lower.startsWith("sec-ch-ua") || lower === "user-agent" || lower === "x-samescreen-header-token") continue;
+      for (const existingKey of Object.keys(next)) {
+        if (existingKey.toLowerCase() === lower) delete next[existingKey];
+      }
+      next[key] = value;
+    }
   }
   return {
     ...next,

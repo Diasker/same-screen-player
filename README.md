@@ -8,19 +8,19 @@ Playback uses embedded Electron `<webview>` elements. The real Chrome browser is
 
 ## Features
 
-- Supports single, 2-pane, 3-pane, 4-pane (2×2), and 6-pane (3×2) layouts with adjustable dividers.
+- Supports single, 2-pane, 3-pane, 4-pane (2×2), and 6-pane (3×2) presets, plus a **Custom** `columns × rows` grid picker/input and unlimited pane splits with adjustable dividers.
 - App mode provides play, pause, seek, volume, mute, speed, reload, split, session, and ad-block controls; Web mode keeps the site's native controls.
 - The seek bar supports live scrubbing while holding the mouse button; playback speed includes presets and custom values from `0.25x` to `4x`.
-- In App mode, drag a pane to exchange grid positions and right-click a pane to close it; at least one pane is always kept.
+- In App mode, drag a pane to exchange grid positions and right-click a pane to **Split horizontally**, **Split vertically**, or **Close current pane**; at least one pane is always kept.
 - Each pane has Back/Forward history controls; in Web mode, `Alt + ←/→` navigates the active pane.
-- The top font-size control supports `80%`, `90%`, `100%`, `110%`, `125%`, and `140%`; the choice persists without changing website fonts.
+- The top font-size control supports `80%`, `90%`, `100%`, `110%`, `125%`, `140%`, and custom values (`50%`–`250%`); the choice persists without changing website fonts.
 - Proxy modes include system proxy, direct connection, and custom HTTP. A global proxy can be overridden per pane, and pane settings take priority.
 - Custom HTTP proxy settings support host, port, bypass rules, and local-address bypass; SOCKS and proxy authentication are not supported.
 - Panes share a login session by default. Selecting a pane-specific proxy automatically switches that pane to an isolated Session and warns about Cookie isolation.
 - Cloudflare challenge resources remain available inside Electron panes, while browser fingerprint emulation helps most sites complete verification; automatic refresh stops when a loop is detected.
 - Use the system file picker to play one local MP4, M4V, WebM, MOV, or OGV video with the existing play, seek, volume, and speed controls.
 - Supported HTML5 players inside same-origin, cross-origin, or nested iframes can reuse the application play, seek, volume, mute, and speed controls.
-- Supports video and file downloads: handles direct video links and browser downloads out of the box, and integrates `yt-dlp` + `ffmpeg` (with one-click in-app setup or custom binary paths) for quality selection, stream merging, and live download progress on YouTube, bilibili, and other supported sites.
+- Supports video and file downloads: handles direct video links and browser downloads out of the box, integrates `yt-dlp` + `ffmpeg` (with one-click in-app setup or custom binary paths) for quality selection, stream merging, and live download progress on YouTube, bilibili, and other supported sites, accelerates separated audio/video streams via concurrent multi-threaded HTTP `Range` chunking, tracks active in-page episode/iframe switches on generic video sites, and supports pausing/resuming active tasks.
 
 ## Usage
 
@@ -45,7 +45,8 @@ When a local video is active, use the webpage address field in the App-mode cont
 ### Pane management
 
 - In App mode, hold the left mouse button on a pane's empty or page area to exchange it with another pane. Buttons, inputs, and menus do not start a drag.
-- In App mode, right-click a pane and choose **Close current pane**. The action is disabled when only one pane remains.
+- In App mode, right-click a pane for **Split horizontally**, **Split vertically**, or **Close current pane**; closing is disabled when only one pane remains.
+- Use **Custom** in the top layout bar to pick from a `6×6` visual matrix or enter any `columns × rows` grid size without a pane-count cap.
 - The session button in each pane switches between shared and isolated Sessions. A pane proxy override automatically uses an isolated Session.
 
 ### Proxy settings

@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  createCustomGrid,
   createPreset,
   getPaneIds,
+  isLayoutNode,
   removePane,
   setRatioAtPath,
   splitPane,
@@ -50,5 +52,18 @@ describe("layout model", () => {
     expect(getPaneIds(swapped)).toEqual(["pane-4", "pane-2", "pane-3", "pane-1"]);
     expect(getPaneIds(swapped).sort()).toEqual(getPaneIds(layout).sort());
     expect(swapPanePositions(layout, "missing", "pane-1")).toEqual(layout);
+  });
+
+  it("creates unlimited custom column x row grids with valid persisted layout nodes", () => {
+    const grid4x4 = createCustomGrid(4, 4);
+    expect(getPaneIds(grid4x4)).toHaveLength(16);
+    expect(isLayoutNode(grid4x4)).toBe(true);
+
+    const grid10x2 = createCustomGrid(10, 2);
+    expect(getPaneIds(grid10x2)).toHaveLength(20);
+    expect(isLayoutNode(grid10x2)).toBe(true);
+
+    const clamped = setRatioAtPath(createPreset("split-2"), [], 0);
+    expect(isLayoutNode(clamped)).toBe(true);
   });
 });

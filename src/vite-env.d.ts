@@ -43,6 +43,8 @@ interface DesktopApi {
   probePaneDownload: (probeId: string, paneId: string) => Promise<DownloadProbeResult>;
   cancelProbeDownload: (probeId: string) => Promise<boolean>;
   startDownload: (request: DownloadStartRequest) => Promise<{ ok: true; taskId: string } | { ok: false; message: string }>;
+  pauseDownloadTask: (taskId: string) => Promise<boolean>;
+  resumeDownloadTask: (taskId: string) => Promise<boolean>;
   cancelDownloadTask: (taskId: string) => Promise<boolean>;
   removeDownloadTask: (taskId: string) => Promise<boolean>;
   clearFinishedDownloads: () => Promise<boolean>;

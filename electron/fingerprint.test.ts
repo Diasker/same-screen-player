@@ -6,8 +6,11 @@ import {
   chromeFullVersion,
   chromeMajorVersion,
   chromeUserAgent,
+  INTERNAL_REQUEST_HEADER_TOKEN,
   mainWorldFingerprintScript,
+  registerSessionHeaderOverride,
   secChUaPlatform,
+  unregisterSessionHeaderOverride,
 } from "./fingerprint";
 
 describe("Chrome fingerprint helpers", () => {
@@ -67,6 +70,27 @@ describe("Chrome fingerprint helpers", () => {
     expect(result["accept"]).toBe("text/html");
     expect(result["sec-ch-ua"]).toContain("Google Chrome");
     expect(result["sec-ch-ua"]).not.toContain("Electron");
+  });
+
+  it("injects registered session header overrides (such as Referer) and strips the internal token", () => {
+    const token = "test-override-token";
+    registerSessionHeaderOverride(token, { Referer: "https://player.example.com/embed/1" });
+    try {
+      const result = applyChromeRequestHeaders({
+        [INTERNAL_REQUEST_HEADER_TOKEN]: token,
+        referer: "https://stale.example.com/",
+        accept: "*/*",
+      });
+      expect(result[INTERNAL_REQUEST_HEADER_TOKEN]).toBeUndefined();
+      expect(result.referer).toBeUndefined();
+      expect(result.Referer).toBe("https://player.example.com/embed/1");
+      expect(result.accept).toBe("*/*");
+    } finally {
+      unregisterSessionHeaderOverride(token);
+    }
+    const afterUnregister = applyChromeRequestHeaders({ [INTERNAL_REQUEST_HEADER_TOKEN]: token });
+    expect(afterUnregister[INTERNAL_REQUEST_HEADER_TOKEN]).toBeUndefined();
+    expect(afterUnregister.Referer).toBeUndefined();
   });
 
   it("produces a self-contained main-world script without Electron references", () => {

@@ -156,9 +156,13 @@ async function runChecks() {
 
     const slowTask = popover.locator(".download-task-item", { hasText: "慢速视频.mp4" });
     await expect(slowTask).toBeVisible();
+    await slowTask.getByRole("button", { name: "暂停", exact: true }).click();
+    await expect(slowTask).toContainText("已暂停");
+    await slowTask.getByRole("button", { name: "继续", exact: true }).click();
+    await expect(slowTask.getByRole("button", { name: "暂停", exact: true })).toBeVisible();
     await slowTask.getByRole("button", { name: "取消", exact: true }).click();
     await expect(slowTask).toContainText("已取消");
-    console.log("PASS fullscreen pane download button and active task cancellation verified");
+    console.log("PASS fullscreen pane download button, pause/resume, and active task cancellation verified");
   } finally {
     if (slowStreamResponse && !slowStreamResponse.destroyed) {
       slowStreamResponse.destroy();

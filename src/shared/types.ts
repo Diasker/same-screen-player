@@ -98,8 +98,6 @@ export type PersistedLayout = {
   layout: LayoutNode;
 };
 
-export const MAX_PANES = 6;
-
 export const LOCAL_VIDEO_FILE_EXTENSIONS = ["mp4", "m4v", "webm", "mov", "ogv"] as const;
 
 export function isSupportedLocalVideoFile(fileName: string, isFile = true): boolean {
@@ -215,8 +213,8 @@ export function isLayoutNode(value: unknown): value is LayoutNode {
   return (
     (node.orientation === "horizontal" || node.orientation === "vertical") &&
     typeof node.ratio === "number" &&
-    node.ratio > 0.1 &&
-    node.ratio < 0.9 &&
+    node.ratio >= 0.1 &&
+    node.ratio <= 0.9 &&
     isLayoutNode(node.first) &&
     isLayoutNode(node.second)
   );
@@ -238,8 +236,8 @@ function split(first: LayoutNode, second: LayoutNode, orientation: Orientation):
 function splitSequence(nodes: LayoutNode[], orientation: Orientation): LayoutNode {
   if (nodes.length === 0) throw new Error("Cannot split an empty sequence");
   if (nodes.length === 1) return nodes[0];
-  const firstCount = 1;
-  const first = nodes.slice(0, firstCount)[0];
+  const firstCount = Math.floor(nodes.length / 2);
+  const first = splitSequence(nodes.slice(0, firstCount), orientation);
   const second = splitSequence(nodes.slice(firstCount), orientation);
   return { kind: "split", orientation, ratio: firstCount / nodes.length, first, second };
 }
@@ -252,6 +250,12 @@ function makeGrid(columns: number, rows: number): LayoutNode {
     columnNodes.push(splitSequence(panes, "vertical"));
   }
   return splitSequence(columnNodes, "horizontal");
+}
+
+export function createCustomGrid(columns: number, rows: number): LayoutNode {
+  const safeColumns = Number.isFinite(columns) ? Math.max(1, Math.floor(columns)) : 1;
+  const safeRows = Number.isFinite(rows) ? Math.max(1, Math.floor(rows)) : 1;
+  return makeGrid(safeColumns, safeRows);
 }
 
 export function createPreset(preset: Preset): LayoutNode {

@@ -5,9 +5,13 @@ import {
   formatBytes,
   formatEta,
   formatSpeed,
+  hasExtractableMediaInfo,
+  isUnsupportedMediaExtension,
+  normalizeDownloadProbeUrl,
   parseYtDlpProgressLine,
   resolveYtDlpProxyUrl,
   sanitizeDownloadFileName,
+  selectConcurrentFormats,
 } from "./downloads";
 
 describe("download helpers", () => {
@@ -105,5 +109,122 @@ describe("download helpers", () => {
     );
     expect(ukContent).toContain("PLAY\tok");
     expect(ukContent).not.toContain("BANK");
+  });
+
+  it("normalizes localized bilibili URLs and rejects html-only extractor responses", () => {
+    expect(normalizeDownloadProbeUrl("https://www.bilibili.com/zh-Hans/video/BV14uWC6bEz2/?p=2")).toBe(
+      "https://www.bilibili.com/video/BV14uWC6bEz2/?p=2"
+    );
+    expect(normalizeDownloadProbeUrl("https://m.bilibili.com/zh-Hant/bangumi/play/ep12345")).toBe(
+      "https://www.bilibili.com/bangumi/play/ep12345"
+    );
+    expect(normalizeDownloadProbeUrl("https://www.youtube.com/watch?v=abc")).toBe(
+      "https://www.youtube.com/watch?v=abc"
+    );
+
+    expect(isUnsupportedMediaExtension("html")).toBe(true);
+    expect(isUnsupportedMediaExtension("mp4")).toBe(false);
+    expect(hasExtractableMediaInfo({ ext: "html" })).toBe(false);
+    expect(hasExtractableMediaInfo({ ext: "mp4", formats: [{ ext: "html" }] })).toBe(false);
+    expect(hasExtractableMediaInfo({ ext: "mp4", formats: [{ ext: "mp4", vcodec: "avc1" }] })).toBe(true);
+    expect(hasExtractableMediaInfo({ ext: "mp4" })).toBe(true);
+  });
+
+  it("selects direct concurrent streams for DASH formats and rejects non-direct or unmergeable streams", () => {
+    const dashFormats = [
+      {
+        format_id: "30080",
+        ext: "mp4",
+        protocol: "https",
+        url: "https://cdn.example.com/v1080.m4s",
+        vcodec: "avc1",
+        acodec: "none",
+        height: 1080,
+        tbr: 3200,
+        http_headers: { Referer: "https://www.bilibili.com/" },
+      },
+      {
+        format_id: "30064",
+        ext: "mp4",
+        protocol: "https",
+        url: "https://cdn.example.com/v720.m4s",
+        vcodec: "avc1",
+        acodec: "none",
+        height: 720,
+        tbr: 1500,
+      },
+      {
+        format_id: "30280",
+        ext: "m4a",
+        protocol: "https",
+        url: "https://cdn.example.com/a192.m4s",
+        vcodec: "none",
+        acodec: "mp4a",
+        abr: 192,
+      },
+    ];
+
+    const dualBest = selectConcurrentFormats(dashFormats, "best", true, { "User-Agent": "UA" });
+    expect(dualBest).toEqual({
+      mode: "dual",
+      video: {
+        formatId: "30080",
+        url: "https://cdn.example.com/v1080.m4s",
+        ext: "mp4",
+        headers: { "User-Agent": "UA", Referer: "https://www.bilibili.com/" },
+      },
+      audio: {
+        formatId: "30280",
+        url: "https://cdn.example.com/a192.m4s",
+        ext: "m4a",
+        headers: { "User-Agent": "UA" },
+      },
+      isAudioOnly: false,
+    });
+
+    const dual720 = selectConcurrentFormats(dashFormats, "h:720", true);
+    expect(dual720?.mode).toBe("dual");
+    if (dual720?.mode === "dual") {
+      expect(dual720.video.formatId).toBe("30064");
+    }
+
+    const audioOnly = selectConcurrentFormats(dashFormats, "audio", true);
+    expect(audioOnly).toEqual({
+      mode: "single",
+      stream: {
+        formatId: "30280",
+        url: "https://cdn.example.com/a192.m4s",
+        ext: "m4a",
+        headers: {},
+      },
+      isAudioOnly: true,
+    });
+
+    // Without ffmpeg, separated DASH video+audio cannot be merged directly
+    expect(selectConcurrentFormats(dashFormats, "best", false)).toBeNull();
+
+    // Prevent downgrading if top requested height is HLS while lower height is direct MP4
+    const mixedFormats = [
+      {
+        format_id: "hls-1080",
+        ext: "mp4",
+        protocol: "m3u8_native",
+        url: "https://cdn.example.com/1080.m3u8",
+        vcodec: "avc1",
+        acodec: "mp4a",
+        height: 1080,
+      },
+      {
+        format_id: "mp4-360",
+        ext: "mp4",
+        protocol: "https",
+        url: "https://cdn.example.com/360.mp4",
+        vcodec: "avc1",
+        acodec: "mp4a",
+        height: 360,
+      },
+    ];
+    expect(selectConcurrentFormats(mixedFormats, "best", true)).toBeNull();
+    expect(selectConcurrentFormats(mixedFormats, "h:360", true)?.mode).toBe("single");
   });
 });
