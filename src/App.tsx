@@ -187,6 +187,8 @@ function normalizePlayback(value: unknown, previous: PlaybackSnapshot): Playback
   };
 }
 
+type GlobalPlaybackCommand = "pause" | "play";
+
 type PaneViewProps = {
   runtime: PaneRuntime;
   active: boolean;
@@ -200,6 +202,7 @@ type PaneViewProps = {
   onOpenChrome: () => void;
   onDownload: () => void;
   onProxyChange: (settings: PaneProxySettings) => void;
+  onRegisterCommandHandler: (handler: ((command: GlobalPlaybackCommand) => void) | null) => void;
   interactionMode: InteractionMode;
   debugOverlays: boolean;
 };
@@ -241,6 +244,7 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
   const activeRef = useRef(props.active);
   const onUpdateRef = useRef(props.onUpdate);
   const onActiveRef = useRef(props.onActive);
+  const onRegisterCommandHandlerRef = useRef(props.onRegisterCommandHandler);
   const [draftUrl, setDraftUrl] = useState(runtime.url);
   const [showControls, setShowControls] = useState(false);
   const [seekDraft, setSeekDraft] = useState<number | null>(null);
@@ -256,6 +260,7 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
   activeRef.current = props.active;
   onUpdateRef.current = props.onUpdate;
   onActiveRef.current = props.onActive;
+  onRegisterCommandHandlerRef.current = props.onRegisterCommandHandler;
   const isLocalVideo = runtime.mediaSource === "local";
 
   if (requestedUrlRef.current !== runtime.url) {
@@ -292,6 +297,22 @@ const PaneView = memo(function PaneView(props: PaneViewProps): ReactElement {
   useEffect(() => () => {
     if (controlsHideTimerRef.current !== null) window.clearTimeout(controlsHideTimerRef.current);
   }, []);
+
+  useEffect(() => {
+    onRegisterCommandHandlerRef.current((command) => {
+      if (!runtimeRef.current.url) return;
+      if (webviewRef.current && webviewReadyRef.current) {
+        try {
+          webviewRef.current.send("video-command", { type: command });
+        } catch {
+        }
+      }
+      onUpdateRef.current({ userPauseIntent: command === "pause" });
+    });
+    return () => {
+      onRegisterCommandHandlerRef.current(null);
+    };
+  }, [runtime.paneId]);
 
   useEffect(() => {
     const offBlocked = window.desktop.onAdblockBlocked(event => {
@@ -956,6 +977,7 @@ type LayoutSurfaceProps = {
   onRemove: (paneId: string) => void;
   onOpenChrome: (paneId: string) => void;
   onDownloadPane: (paneId: string) => void;
+  onRegisterPaneCommandHandler: (paneId: string, handler: ((command: GlobalPlaybackCommand) => void) | null) => void;
   interactionMode: InteractionMode;
   debugOverlays: boolean;
 };
@@ -1054,7 +1076,7 @@ function LayoutSurface(props: LayoutSurfaceProps): ReactElement {
         const runtime = props.runtimes[rect.paneId] ?? makeRuntime(rect.paneId);
         const isDragged = dragState?.paneId === rect.paneId && dragState.dragging;
         const isDropTarget = dragState?.targetPaneId === rect.paneId;
-        return <div key={rect.paneId} ref={(element) => { if (element) paneRefs.current.set(rect.paneId, element); else paneRefs.current.delete(rect.paneId); }} className={`layout-pane ${isDragged ? "is-dragging" : ""} ${isDropTarget ? "is-drop-target" : ""}`} style={{ left: `${rect.left * 100}%`, top: `${rect.top * 100}%`, width: `${rect.width * 100}%`, height: `${rect.height * 100}%`, transform: isDragged ? `translate(${dragState.offsetX}px, ${dragState.offsetY}px)` : undefined }} onPointerDown={(event) => startDrag(event, rect.paneId)} onPointerMove={updateDrag} onPointerUp={finishDrag} onPointerCancel={finishDrag} onContextMenu={(event) => showContextMenu(event, rect.paneId)}><PaneView runtime={runtime} active={props.activePaneId === rect.paneId} paneDownloadProgress={props.activeDownloadProgressByPane[rect.paneId] ?? null} interactionMode={props.interactionMode} debugOverlays={props.debugOverlays} guestPreloadUrl={props.guestPreloadUrl} onActive={() => props.onActive(rect.paneId)} onNavigate={(value) => props.onNavigate(rect.paneId, value)} onUpdate={(patch) => props.onUpdatePane(rect.paneId, patch)} onProxyChange={(settings) => props.onProxyChange(rect.paneId, settings)} onSplit={(orientation) => props.onSplit(rect.paneId, orientation)} onRemove={() => props.onRemove(rect.paneId)} onOpenChrome={() => props.onOpenChrome(rect.paneId)} onDownload={() => props.onDownloadPane(rect.paneId)} /></div>;
+        return <div key={rect.paneId} ref={(element) => { if (element) paneRefs.current.set(rect.paneId, element); else paneRefs.current.delete(rect.paneId); }} className={`layout-pane ${isDragged ? "is-dragging" : ""} ${isDropTarget ? "is-drop-target" : ""}`} style={{ left: `${rect.left * 100}%`, top: `${rect.top * 100}%`, width: `${rect.width * 100}%`, height: `${rect.height * 100}%`, transform: isDragged ? `translate(${dragState.offsetX}px, ${dragState.offsetY}px)` : undefined }} onPointerDown={(event) => startDrag(event, rect.paneId)} onPointerMove={updateDrag} onPointerUp={finishDrag} onPointerCancel={finishDrag} onContextMenu={(event) => showContextMenu(event, rect.paneId)}><PaneView runtime={runtime} active={props.activePaneId === rect.paneId} paneDownloadProgress={props.activeDownloadProgressByPane[rect.paneId] ?? null} interactionMode={props.interactionMode} debugOverlays={props.debugOverlays} guestPreloadUrl={props.guestPreloadUrl} onActive={() => props.onActive(rect.paneId)} onNavigate={(value) => props.onNavigate(rect.paneId, value)} onUpdate={(patch) => props.onUpdatePane(rect.paneId, patch)} onProxyChange={(settings) => props.onProxyChange(rect.paneId, settings)} onSplit={(orientation) => props.onSplit(rect.paneId, orientation)} onRemove={() => props.onRemove(rect.paneId)} onOpenChrome={() => props.onOpenChrome(rect.paneId)} onDownload={() => props.onDownloadPane(rect.paneId)} onRegisterCommandHandler={(handler) => props.onRegisterPaneCommandHandler(rect.paneId, handler)} /></div>;
       })}
       {geometry.dividers.map((divider) => <LayoutDivider key={divider.path.join(".")} divider={divider} onResize={props.onResize} />)}
       {contextMenu && (
@@ -1197,6 +1219,7 @@ export default function App(): ReactElement {
   const activeProbeIdRef = useRef<string | null>(null);
   const prevToolsAvailabilityRef = useRef<{ ytDlp: boolean; ffmpeg: boolean } | null>(null);
   const prevTaskStatusesRef = useRef<Map<string, DownloadTask["status"]>>(new Map());
+  const paneCommandHandlersRef = useRef(new Map<string, (command: GlobalPlaybackCommand) => void>());
   const [debugOverlays, setDebugOverlays] = useState(import.meta.env.DEV);
   const paneIds = useMemo(() => getPaneIds(layout), [layout]);
 
@@ -1497,6 +1520,32 @@ export default function App(): ReactElement {
     setFullscreen(value);
   };
   const toggleInputMode = () => setInteractionMode(toggleInteractionMode);
+  const registerPaneCommandHandler = useCallback((paneId: string, handler: ((command: GlobalPlaybackCommand) => void) | null) => {
+    if (handler) paneCommandHandlersRef.current.set(paneId, handler);
+    else paneCommandHandlersRef.current.delete(paneId);
+  }, []);
+  const loadedPaneCount = useMemo(
+    () => paneIds.filter((paneId) => Boolean(runtimes[paneId]?.url)).length,
+    [paneIds, runtimes]
+  );
+  const pauseAllPanes = useCallback(() => {
+    let count = 0;
+    paneIds.forEach((paneId) => {
+      if (!runtimes[paneId]?.url) return;
+      paneCommandHandlersRef.current.get(paneId)?.("pause");
+      count += 1;
+    });
+    if (count > 0) setStatus(`已暂停全部播放（${count} 个分屏）`);
+  }, [paneIds, runtimes]);
+  const resumeAllPanes = useCallback(() => {
+    let count = 0;
+    paneIds.forEach((paneId) => {
+      if (!runtimes[paneId]?.url) return;
+      paneCommandHandlersRef.current.get(paneId)?.("play");
+      count += 1;
+    });
+    if (count > 0) setStatus(`已继续全部播放（${count} 个分屏）`);
+  }, [paneIds, runtimes]);
   const updatePaneProxy = useCallback((paneId: string, settings: PaneProxySettings) => {
     const runtime = runtimes[paneId];
     if (!runtime) return;
@@ -1728,7 +1777,7 @@ export default function App(): ReactElement {
 
   return (
     <div className={`app-shell ${fullscreen ? "is-fullscreen" : ""} ${htmlFullscreen ? "is-html-fullscreen" : ""} ${interactionMode === "app" ? "is-app-input-mode" : "is-web-input-mode"}`} style={{ "--app-font-scale": fontScale } as CSSProperties}>
-       <header className="app-header"><div className="brand"><div className="brand-mark">▦</div><div><div className="brand-title">同屏播放</div><div className="brand-subtitle">沉浸式多视频工作台</div></div></div><div className="header-actions"><span className={`interaction-mode ${interactionMode}`}>{interactionMode === "web" ? "网页操作" : "应用操作"}</span><button className="header-button" onClick={toggleInputMode}>{interactionMode === "web" ? "切到应用层" : "切回网页层"} · F8</button><button className={`header-button download-button ${activeTasks.length > 0 || downloadPopoverOpen ? "selected" : ""}`} onClick={toggleHeaderDownloadPopover}>{headerDownloadLabel}</button><button className={`header-button proxy-button ${globalProxy.mode === "custom" ? "selected" : ""}`} onClick={openGlobalProxyEditor}>代理：{proxyModeLabel(globalProxy.mode)}</button><div className="font-scale-wrapper"><label className="font-scale-control"><span>字号</span><select aria-label="应用字号" value={String(fontScale)} onChange={(event) => { if (event.target.value === CUSTOM_FONT_SCALE_VALUE) { setCustomFontScaleInput(String(Math.round(fontScale * 100))); setCustomFontScaleOpen(true); return; } setCustomFontScaleOpen(false); setFontScale(Number(event.target.value)); }}>{!FONT_SCALE_OPTIONS.includes(fontScale) && <option value={String(fontScale)}>{Math.round(fontScale * 100)}%</option>}{FONT_SCALE_OPTIONS.map((value) => <option key={value} value={String(value)}>{Math.round(value * 100)}%</option>)}<option value={CUSTOM_FONT_SCALE_VALUE}>自定义…</option></select></label>{customFontScaleOpen && <div className="proxy-popover custom-font-popover" role="dialog" aria-label="自定义字号" onPointerDown={(event) => event.stopPropagation()}><div className="custom-grid-title"><span>自定义应用字号</span><span className="custom-grid-preview-label">50% – 250%</span></div><div className="custom-font-row"><input type="number" min={50} max={250} step={5} aria-label="自定义字号百分比" value={customFontScaleInput} onChange={(event) => setCustomFontScaleInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") applyCustomFontScale(); }} /><span className="custom-font-unit">%</span><button type="button" className="icon-button primary" onClick={applyCustomFontScale}>应用</button></div></div>}</div><span className="pane-count">{paneIds.length} 格</span><button className="header-button" onClick={() => void toggleFullscreen()}>{fullscreen ? "退出全屏" : "全屏"}</button><button className="header-button" onClick={() => void save()}>保存布局</button><button className="header-button subtle" onClick={() => void clearSession()}>清除登录</button></div>{globalProxyOpen && <div className="proxy-popover global-proxy-popover" onPointerDown={(event) => event.stopPropagation()} role="dialog" aria-label="全局代理设置"><div className="proxy-popover-title">全局代理设置</div><div className="proxy-form-hint">仅影响 Electron 内嵌分屏，不改变外部 Chrome 的网络设置。</div><label className="proxy-mode-field">代理模式<select value={globalProxyDraft.mode} onChange={(event) => setGlobalProxyDraft((current) => ({ ...current, mode: event.target.value as GlobalProxySettings["mode"] }))}><option value="system">系统代理</option><option value="direct">直连（不使用代理）</option><option value="custom">自定义 HTTP</option></select></label>{globalProxyDraft.mode === "custom" && <><label className="proxy-checkbox"><input type="checkbox" checked={globalProxyDraft.mode === "custom"} onChange={(event) => setGlobalProxyDraft((current) => ({ ...current, mode: event.target.checked ? "custom" : "direct" }))} />使用代理服务器</label><ProxyEndpointFields value={globalProxyDraft.custom} onChange={(custom) => setGlobalProxyDraft((current) => ({ ...current, custom }))} /></>}{globalProxyError && <div className="proxy-form-error">{globalProxyError}</div>}<div className="proxy-form-actions"><button className="icon-button" onClick={() => { setGlobalProxyOpen(false); setGlobalProxyError(null); }}>取消</button><button className="icon-button primary" onClick={() => void saveGlobalProxy()}>保存</button></div></div>}</header>
+       <header className="app-header"><div className="brand"><div className="brand-mark">▦</div><div><div className="brand-title">同屏播放</div><div className="brand-subtitle">沉浸式多视频工作台</div></div></div><div className="header-actions"><span className={`interaction-mode ${interactionMode}`}>{interactionMode === "web" ? "网页操作" : "应用操作"}</span><button className="header-button" onClick={toggleInputMode}>{interactionMode === "web" ? "切到应用层" : "切回网页层"} · F8</button><button className="header-button" disabled={loadedPaneCount === 0} onClick={pauseAllPanes} title="暂停所有分屏中的视频">全部暂停</button><button className="header-button" disabled={loadedPaneCount === 0} onClick={resumeAllPanes} title="继续播放所有分屏中的视频">全部继续播放</button><button className={`header-button download-button ${activeTasks.length > 0 || downloadPopoverOpen ? "selected" : ""}`} onClick={toggleHeaderDownloadPopover}>{headerDownloadLabel}</button><button className={`header-button proxy-button ${globalProxy.mode === "custom" ? "selected" : ""}`} onClick={openGlobalProxyEditor}>代理：{proxyModeLabel(globalProxy.mode)}</button><div className="font-scale-wrapper"><label className="font-scale-control"><span>字号</span><select aria-label="应用字号" value={String(fontScale)} onChange={(event) => { if (event.target.value === CUSTOM_FONT_SCALE_VALUE) { setCustomFontScaleInput(String(Math.round(fontScale * 100))); setCustomFontScaleOpen(true); return; } setCustomFontScaleOpen(false); setFontScale(Number(event.target.value)); }}>{!FONT_SCALE_OPTIONS.includes(fontScale) && <option value={String(fontScale)}>{Math.round(fontScale * 100)}%</option>}{FONT_SCALE_OPTIONS.map((value) => <option key={value} value={String(value)}>{Math.round(value * 100)}%</option>)}<option value={CUSTOM_FONT_SCALE_VALUE}>自定义…</option></select></label>{customFontScaleOpen && <div className="proxy-popover custom-font-popover" role="dialog" aria-label="自定义字号" onPointerDown={(event) => event.stopPropagation()}><div className="custom-grid-title"><span>自定义应用字号</span><span className="custom-grid-preview-label">50% – 250%</span></div><div className="custom-font-row"><input type="number" min={50} max={250} step={5} aria-label="自定义字号百分比" value={customFontScaleInput} onChange={(event) => setCustomFontScaleInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") applyCustomFontScale(); }} /><span className="custom-font-unit">%</span><button type="button" className="icon-button primary" onClick={applyCustomFontScale}>应用</button></div></div>}</div><span className="pane-count">{paneIds.length} 格</span><button className="header-button" onClick={() => void toggleFullscreen()}>{fullscreen ? "退出全屏" : "全屏"}</button><button className="header-button" onClick={() => void save()}>保存布局</button><button className="header-button subtle" onClick={() => void clearSession()}>清除登录</button></div>{globalProxyOpen && <div className="proxy-popover global-proxy-popover" onPointerDown={(event) => event.stopPropagation()} role="dialog" aria-label="全局代理设置"><div className="proxy-popover-title">全局代理设置</div><div className="proxy-form-hint">仅影响 Electron 内嵌分屏，不改变外部 Chrome 的网络设置。</div><label className="proxy-mode-field">代理模式<select value={globalProxyDraft.mode} onChange={(event) => setGlobalProxyDraft((current) => ({ ...current, mode: event.target.value as GlobalProxySettings["mode"] }))}><option value="system">系统代理</option><option value="direct">直连（不使用代理）</option><option value="custom">自定义 HTTP</option></select></label>{globalProxyDraft.mode === "custom" && <><label className="proxy-checkbox"><input type="checkbox" checked={globalProxyDraft.mode === "custom"} onChange={(event) => setGlobalProxyDraft((current) => ({ ...current, mode: event.target.checked ? "custom" : "direct" }))} />使用代理服务器</label><ProxyEndpointFields value={globalProxyDraft.custom} onChange={(custom) => setGlobalProxyDraft((current) => ({ ...current, custom }))} /></>}{globalProxyError && <div className="proxy-form-error">{globalProxyError}</div>}<div className="proxy-form-actions"><button className="icon-button" onClick={() => { setGlobalProxyOpen(false); setGlobalProxyError(null); }}>取消</button><button className="icon-button primary" onClick={() => void saveGlobalProxy()}>保存</button></div></div>}</header>
        <div className="toolbar">
          <span className="toolbar-label">布局</span>
          <div className="preset-group">
@@ -1820,7 +1869,7 @@ export default function App(): ReactElement {
          </div>
          <div className="toolbar-hint">{interactionMode === "web" ? "网页播放器直接接收鼠标和键盘 · F8 切换应用层" : "应用层接管活动分屏 · 鼠标移到底部显示控制"}</div>
        </div>
-       <main className="workspace">{guestPreloadUrl ? <LayoutSurface layout={layout} runtimes={runtimes} activePaneId={activePaneId} activeDownloadProgressByPane={activeDownloadProgressByPane} interactionMode={interactionMode} debugOverlays={debugOverlays} guestPreloadUrl={guestPreloadUrl} onActive={setActivePaneId} onNavigate={navigate} onUpdatePane={updatePane} onProxyChange={updatePaneProxy} onResize={resizeDivider} onSwap={swapPanes} onSplit={split} onRemove={closePane} onOpenChrome={(paneId) => void openChrome(paneId)} onDownloadPane={openPaneDownload} /> : <div className="loading-state">正在准备网页播放内核…</div>}</main>
+       <main className="workspace">{guestPreloadUrl ? <LayoutSurface layout={layout} runtimes={runtimes} activePaneId={activePaneId} activeDownloadProgressByPane={activeDownloadProgressByPane} interactionMode={interactionMode} debugOverlays={debugOverlays} guestPreloadUrl={guestPreloadUrl} onActive={setActivePaneId} onNavigate={navigate} onUpdatePane={updatePane} onProxyChange={updatePaneProxy} onResize={resizeDivider} onSwap={swapPanes} onSplit={split} onRemove={closePane} onOpenChrome={(paneId) => void openChrome(paneId)} onDownloadPane={openPaneDownload} onRegisterPaneCommandHandler={registerPaneCommandHandler} /> : <div className="loading-state">正在准备网页播放内核…</div>}</main>
        <footer className="status-bar"><span className="status-dot" /><span>{status}</span><span className="status-spacer" /><span>全局代理：{proxyModeLabel(globalProxy.mode)} · 共享会话 · 安全拦截</span></footer>
       {downloadPopoverOpen && (
         <div
@@ -2021,6 +2070,8 @@ export default function App(): ReactElement {
         <div className="fullscreen-top-zone">
           <div className="fullscreen-top-bar">
             <span className="fullscreen-hint">按 Esc 退出全屏</span>
+            <button className="icon-button" disabled={loadedPaneCount === 0} onClick={pauseAllPanes}>全部暂停</button>
+            <button className="icon-button" disabled={loadedPaneCount === 0} onClick={resumeAllPanes}>全部继续播放</button>
             <button className="icon-button" onClick={() => { if (htmlFullscreen) void window.desktop.exitWebpageFullscreen(htmlFullscreenPaneId ?? activePaneId); else void window.desktop.setFullscreen(false); }}>退出全屏</button>
           </div>
         </div>

@@ -30,6 +30,8 @@ button { cursor: pointer; }
 .header-button, .preset-button, .icon-button { border: 1px solid #303a49; border-radius: 7px; color: #dbe4f1; background: #19212d; transition: background .15s, border-color .15s, color .15s; }
 .header-button { padding: 8px 13px; font-size: calc(12px * var(--app-font-scale)); }
 .header-button:hover, .preset-button:hover, .icon-button:hover { border-color: #5d7698; background: #253347; }
+.header-button:disabled { cursor: default; opacity: .42; }
+.header-button:disabled:hover { border-color: #303a49; background: #19212d; }
 .header-button.subtle { color: #a6b1c2; background: transparent; }
 .proxy-button.selected, .download-button.selected { color: #78dfca; border-color: #3b837e; background: #17332f; }
 .proxy-popover { color: #dbe4f1; border: 1px solid #3b485a; border-radius: 9px; background: #111923f8; box-shadow: 0 14px 36px #000a; }
